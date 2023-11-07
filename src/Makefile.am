@@ -16,7 +16,8 @@ libnccl_net_la_SOURCES = \
         param.c \
 	socket.c \
 	p2p_plugin.c \
-	ib_plugin.c
+	ib_plugin.c \
+	stats_plugin.c
 
 if HAVE_UCX_PLUGIN
 libnccl_net_la_CPPFLAGS += -DHAVE_UCX_PLUGIN $(UCX_CPPFLAGS)

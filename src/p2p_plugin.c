@@ -14,6 +14,8 @@
 #include "debug.h"
 #include "p2p_plugin.h"
 
+extern ncclNet_v6_t ncclStatsInit_v6(const ncclNet_v6_t *plugin);
+
 #ifdef HAVE_UCX_PLUGIN
 extern ncclNet_v7_t ucxPlugin_v7;
 extern ncclNet_v6_t ucxPlugin_v6;
@@ -63,6 +65,13 @@ ncclNet_v5_t ncclNetPlugin_v5 = {
 
 static nccl_p2p_plugin_t p2p_plugin = NCCL_P2P_LAST;
 
+static bool is_enabled(const char *key) {
+  const char *value = getenv(key);
+  return (value != NULL &&
+          (!strcasecmp(value, "y") || !strcasecmp(value, "1") ||
+           !strcasecmp(value, "yes")));
+}
+
 static void pluginSetup()
 {
 
@@ -103,6 +112,9 @@ static void pluginSetup()
 #endif
   }
 
+  if (is_enabled("NCCL_PLUGIN_STATS")) {
+    ncclNetPlugin_v6 = ncclStatsInit_v6(&ncclNetPlugin_v6);
+  }
 }
 
 ncclResult_t pluginInit_v7(ncclDebugLogger_t logFunction) {

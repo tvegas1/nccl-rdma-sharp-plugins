@@ -696,10 +696,10 @@ static void ucx_request_add(ucx_request_t *req, int size) {
   req->count++;
 }
 
+#define CHECK_SIZE 1024
+
 static ncclResult_t ucx_send_check(ucx_comm_t *comm) {
   ucp_request_param_t params;
-  ucp_tag_message_h   msg_tag;
-  ucp_tag_recv_info_t info_tag;
   ucp_ep_params_t     ep_params;
   void                *ucp_req;
   ucs_status_t        status;
@@ -710,20 +710,18 @@ static ncclResult_t ucx_send_check(ucx_comm_t *comm) {
     goto out_check_status;
   }
 
-  msg_tag = ucp_tag_probe_nb(comm->ucx_worker->worker, comm->ctag, tag_mask, 1,
-                             &info_tag);
-  if (msg_tag == NULL) {
-    return ncclSuccess;
-  }
-
-  comm->msg = malloc(info_tag.length);
-  if (comm->msg == NULL) {
-    return ncclSystemError;
-  }
-
   params.op_attr_mask = 0;
-  ucp_req = ucp_tag_msg_recv_nbx(comm->ucx_worker->worker, comm->msg,
-                                 info_tag.length, msg_tag, &params);
+  comm->msg           = calloc(1, CHECK_SIZE);
+  if (comm->msg == NULL) {
+      WARN("Unable to allocate receive connect msg");
+      return ncclSystemError;
+  }
+
+  WARN("VEG tag recv tag 0x%x", comm->ctag);
+  ucp_req = ucp_tag_recv_nbx(comm->ucx_worker->worker,
+                             comm->msg, CHECK_SIZE,
+                             comm->ctag, tag_mask, &params);
+
   if (UCS_PTR_IS_ERR(ucp_req)) {
     WARN("Unable to receive connect msg (%s)",
          ucs_status_string(UCS_PTR_STATUS(ucp_req)));
@@ -780,7 +778,6 @@ ncclResult_t ucx_recv_check(ucx_comm_t *comm) {
   ucp_request_param_t params;
   ucp_address_t       *my_addr;
   size_t              local_addr_len;
-  size_t              msg_len;
 
   if (comm->connect_req != NULL) {
     goto done;
@@ -790,8 +787,7 @@ ncclResult_t ucx_recv_check(ucx_comm_t *comm) {
                                       &local_addr_len));
   nccl_ucx_add_ep(comm->ucx_worker, &comm->sock);
 
-  msg_len             = sizeof(connect_msg_t) + local_addr_len;
-  comm->msg           = calloc(1, msg_len);
+  comm->msg           = calloc(1, CHECK_SIZE);
   comm->msg->addr_len = local_addr_len;
   memcpy(comm->msg + 1, my_addr, local_addr_len);
 
@@ -801,7 +797,7 @@ ncclResult_t ucx_recv_check(ucx_comm_t *comm) {
   params.user_data    = comm;
 
   assert(comm->connect_req == NULL);
-  comm->connect_req   = ucp_tag_send_nbx(comm->ep, comm->msg, msg_len,
+  comm->connect_req   = ucp_tag_send_nbx(comm->ep, comm->msg, CHECK_SIZE,
                                          comm->ctag, &params);
   if (UCS_PTR_IS_ERR(comm->connect_req)) {
     WARN("Unable to send connect message");

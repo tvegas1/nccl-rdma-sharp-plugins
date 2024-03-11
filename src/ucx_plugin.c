@@ -784,11 +784,11 @@ static ncclResult_t nccl_ucx_isend(void *send_comm, void *data, int size,
     params.memh          = mh->ucp_memh;
   }
 
-  WARN("VEG ucx isend n size %d tag %llx/%llx ep %p",
+  WARN("VEG ucx isend n size %d tag %llx/%llx ep %p ucx_request %p",
        size,
        tag,
        nccl_ucx_ucp_tag(comm->tag, tag),
-       comm->ep);
+       comm->ep, req);
 
   ucp_req = ucp_tag_send_nbx(comm->ep, data, size,
                              nccl_ucx_ucp_tag(comm->tag, tag), &params);
@@ -850,8 +850,9 @@ static ncclResult_t nccl_ucx_irecv(void *recv_comm, int n, void **data,
       params.op_attr_mask &= ~UCP_OP_ATTR_FIELD_MEMH;
     }
 
-    WARN("VEG ucx irecv %d/%d ep %p tag %llx/%llx size %zu",
-         i, n, comm->ep, tags[i], nccl_ucx_ucp_tag(comm->tag, tags[i]), sizes[i]);
+    WARN("VEG ucx irecv %d/%d ep %p tag %llx/%llx size %zu ucx_request %p",
+         i, n, comm->ep, tags[i], nccl_ucx_ucp_tag(comm->tag, tags[i]), sizes[i],
+         req);
     ucp_req = ucp_tag_recv_nbx(comm->ucx_worker->worker, data[i], sizes[i],
                                nccl_ucx_ucp_tag(comm->tag, tags[i]), tag_mask,
                                &params);
@@ -887,6 +888,8 @@ ncclResult_t nccl_ucx_iflush(void *recv_comm, int n, void **data, int *sizes,
     return ncclInternalError;
   }
 
+  WARN("VEG ucx iflush ucx_request %p size %zu", req, size);
+
   ucx_request_add(req, size);
 
   params.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
@@ -918,6 +921,8 @@ static ncclResult_t nccl_ucx_test(void *request, int *done, int *size) {
       return ncclSuccess;
     }
   }
+
+  WARN("VEG: completed ucx_request %p", req);
 
   *done = 1;
   if (size != NULL) {

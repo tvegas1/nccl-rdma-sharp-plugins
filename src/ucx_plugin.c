@@ -784,7 +784,11 @@ static ncclResult_t nccl_ucx_isend(void *send_comm, void *data, int size,
     params.memh          = mh->ucp_memh;
   }
 
-  WARN("VEG ucx isend n size %d tag %x ep %p", size, tag, comm->ep);
+  WARN("VEG ucx isend n size %d tag %llx/%llx ep %p",
+       size,
+       tag,
+       nccl_ucx_ucp_tag(comm->tag, tag),
+       comm->ep);
 
   ucp_req = ucp_tag_send_nbx(comm->ep, data, size,
                              nccl_ucx_ucp_tag(comm->tag, tag), &params);
@@ -846,8 +850,8 @@ static ncclResult_t nccl_ucx_irecv(void *recv_comm, int n, void **data,
       params.op_attr_mask &= ~UCP_OP_ATTR_FIELD_MEMH;
     }
 
-    WARN("VEG ucx irecv %d/%d ep %p tag %x",
-         i, n, comm->ep, nccl_ucx_ucp_tag(comm->tag, tags[i]));
+    WARN("VEG ucx irecv %d/%d ep %p tag %llx/%llx size %zu",
+         i, n, comm->ep, tags[i], nccl_ucx_ucp_tag(comm->tag, tags[i]), sizes[i]);
     ucp_req = ucp_tag_recv_nbx(comm->ucx_worker->worker, data[i], sizes[i],
                                nccl_ucx_ucp_tag(comm->tag, tags[i]), tag_mask,
                                &params);

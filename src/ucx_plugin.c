@@ -699,66 +699,21 @@ static void ucx_request_add(ucx_request_t *req, int size) {
 #define CHECK_SIZE 1024
 
 static ncclResult_t ucx_send_check(ucx_comm_t *comm) {
-  ucp_request_param_t params;
   ucp_ep_params_t     ep_params;
-  void                *ucp_req;
-  ucs_status_t        status;
 
-  ucp_worker_progress(comm->ucx_worker->worker);
+  uint8_t data[CHECK_SIZE];
 
-  if (comm->connect_req != NULL) {
-    goto out_check_status;
-  }
+  NCCLCHECK(ncclSocketRecv(&comm->sock, data, sizeof(data)));
 
-  params.op_attr_mask = 0;
-  comm->msg           = calloc(1, CHECK_SIZE);
-  if (comm->msg == NULL) {
-      WARN("Unable to allocate receive connect msg");
-      return ncclSystemError;
-  }
+  comm->msg = (void*)data;
 
-  WARN("VEG tag recv tag 0x%x", comm->ctag);
-  ucp_req = ucp_tag_recv_nbx(comm->ucx_worker->worker,
-                             comm->msg, CHECK_SIZE,
-                             comm->ctag, tag_mask, &params);
-
-  if (UCS_PTR_IS_ERR(ucp_req)) {
-    WARN("Unable to receive connect msg (%s)",
-         ucs_status_string(UCS_PTR_STATUS(ucp_req)));
-    free(comm->msg);
-    comm->msg = NULL;
-    return ncclSystemError;
-  } else if (ucp_req == NULL) {
-    goto out_set_ready;
-  }
-
-  assert(comm->connect_req == NULL);
-  comm->connect_req = ucp_req;
-
-out_check_status:
-  status = ucp_request_check_status(comm->connect_req);
-  if (status == UCS_INPROGRESS) {
-    return ncclSuccess;
-  }
-
-  if (status != UCS_OK) {
-    free(comm->msg);
-    comm->msg = NULL;
-    WARN("Send check requested returned error (%s)", ucs_status_string(status));
-    return ncclSystemError;
-  }
-
-  ucp_request_free(comm->connect_req);
-  comm->connect_req = NULL;
-
-out_set_ready:
   ep_params.field_mask = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS;
-  ep_params.address    = (ucp_address_t*)(comm->msg + 1);
+  ep_params.address    = (ucp_address_t*)data;
   UCXCHECK(ucp_ep_create(comm->ucx_worker->worker, &ep_params, &comm->ep));
   comm->ready = 1;
-  free(comm->msg);
   comm->msg = NULL;
 
+      WARN("ISEND CHECK READY");
   return ncclSuccess;
 }
 
@@ -768,47 +723,23 @@ static void ucx_recv_set_ready(ucx_comm_t *comm) {
   comm->ready = 1;
 }
 
-static void check_handler(void *request, ucs_status_t status, void *user_data) {
-  assert(status == UCS_OK);
-  ucx_recv_set_ready((ucx_comm_t*)user_data);
-  ucp_request_free(request);
-}
-
 ncclResult_t ucx_recv_check(ucx_comm_t *comm) {
-  ucp_request_param_t params;
   ucp_address_t       *my_addr;
   size_t              local_addr_len;
+  uint8_t             data[CHECK_SIZE];
 
-  if (comm->connect_req != NULL) {
-    goto done;
-  }
 
   NCCLCHECK(ucx_worker_get_netaddress(comm->ucx_worker->worker, &my_addr,
                                       &local_addr_len));
+
   nccl_ucx_add_ep(comm->ucx_worker, &comm->sock);
 
-  comm->msg           = calloc(1, CHECK_SIZE);
-  comm->msg->addr_len = local_addr_len;
-  memcpy(comm->msg + 1, my_addr, local_addr_len);
+  memcpy(data, my_addr, local_addr_len);
+  NCCLCHECK(ncclSocketSend(&comm->sock, data, sizeof(data)));
 
-  params.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
-                        UCP_OP_ATTR_FIELD_USER_DATA;
-  params.cb.send      = check_handler;
-  params.user_data    = comm;
+  ucx_recv_set_ready(comm);
+  WARN("IRECV CHECK READY");
 
-  assert(comm->connect_req == NULL);
-  comm->connect_req   = ucp_tag_send_nbx(comm->ep, comm->msg, CHECK_SIZE,
-                                         comm->ctag, &params);
-  if (UCS_PTR_IS_ERR(comm->connect_req)) {
-    WARN("Unable to send connect message");
-    free(comm->msg);
-    return ncclSystemError;
-  } else if (comm->connect_req == NULL) {
-    ucx_recv_set_ready(comm);
-    return ncclSuccess;
-  }
-
-done:
   ucp_worker_progress(comm->ucx_worker->worker);
   return ncclSuccess;
 }
@@ -853,6 +784,7 @@ static ncclResult_t nccl_ucx_isend(void *send_comm, void *data, int size,
     params.memh          = mh->ucp_memh;
   }
 
+  WARN("VEG ucx isend n size %d tag %x ep %p", size, tag, comm->ep);
 
   ucp_req = ucp_tag_send_nbx(comm->ep, data, size,
                              nccl_ucx_ucp_tag(comm->tag, tag), &params);
@@ -901,6 +833,9 @@ static ncclResult_t nccl_ucx_irecv(void *recv_comm, int n, void **data,
   params.cb.recv      = recv_handler_nbx;
   params.user_data    = &req->pending;
 
+  params.op_attr_mask |= UCP_OP_ATTR_FLAG_EP;
+  params.ep            = comm->ep;
+
   for (int i = 0; i < n; i++) {
     ucx_request_add(req, sizes[i]);
 
@@ -911,6 +846,8 @@ static ncclResult_t nccl_ucx_irecv(void *recv_comm, int n, void **data,
       params.op_attr_mask &= ~UCP_OP_ATTR_FIELD_MEMH;
     }
 
+    WARN("VEG ucx irecv %d/%d ep %p tag %x",
+         i, n, comm->ep, nccl_ucx_ucp_tag(comm->tag, tags[i]));
     ucp_req = ucp_tag_recv_nbx(comm->ucx_worker->worker, data[i], sizes[i],
                                nccl_ucx_ucp_tag(comm->tag, tags[i]), tag_mask,
                                &params);

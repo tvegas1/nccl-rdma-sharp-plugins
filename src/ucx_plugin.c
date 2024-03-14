@@ -865,6 +865,8 @@ static ncclResult_t nccl_ucx_irecv(void *recv_comm, int n, void **data,
     }
   }
 
+
+  WARN("VEG ucx irecv returning ucx_request %p", req);
   *request = req;
   return ncclSuccess;
 }
@@ -914,6 +916,7 @@ static ncclResult_t nccl_ucx_test(void *request, int *done, int *size) {
   ucx_request_t *req = request;
   unsigned p;
 
+  WARN("VEG: progress ucx_request %p", req);
   while (req->pending > 0) {
     p = ucp_worker_progress(req->worker);
     if (!p) {
@@ -952,6 +955,7 @@ ncclResult_t nccl_ucx_close_send(void *send_comm) {
   ucx_comm_t *comm = (ucx_comm_t*)send_comm;
   void *close_req;
 
+  WARN("VEG Close send");
   if (comm) {
     if (comm->ep) {
       close_req = ucp_ep_close_nb(comm->ep, UCP_EP_CLOSE_MODE_FLUSH);
@@ -970,6 +974,7 @@ ncclResult_t nccl_ucx_close_recv(void *recv_comm) {
   ucx_comm_t *comm = (ucx_comm_t*)recv_comm;
   void *close_req;
 
+  WARN("VEG Close recv");
   if (comm) {
     if (comm->gpuFlush.enabled) {
       close_req = ucp_ep_close_nb(comm->gpuFlush.flush_ep, UCP_EP_CLOSE_MODE_FLUSH);

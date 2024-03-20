@@ -23,6 +23,7 @@ extern ncclNet_v8_t ucxRmaPlugin_v8;
 extern ncclNet_v7_t ucxRmaPlugin_v7;
 extern ncclNet_v6_t ucxRmaPlugin_v6;
 extern ncclNet_v5_t ucxRmaPlugin_v5;
+extern ncclNet_v8_t ucxUctPlugin_v8;
 #endif
 
 extern ncclNet_v8_t ibPlugin_v8;
@@ -87,6 +88,7 @@ static void pluginSetup()
 #ifdef HAVE_UCX_PLUGIN
     else if (!strcasecmp(p2p_layer, "ucx")) p2p_plugin = NCCL_P2P_UCX;
     else if (!strcasecmp(p2p_layer, "ucx_rma")) p2p_plugin = NCCL_P2P_UCX_RMA;
+    else if (!strcasecmp(p2p_layer, "ucx_uct")) p2p_plugin = NCCL_P2P_UCX_UCT;
 #endif
     else {
       WARN("Invalid value %s for NCCL_PLUGIN_P2P, using default", p2p_layer);
@@ -105,6 +107,9 @@ static void pluginSetup()
       ncclNetPlugin_v7 = ucxRmaPlugin_v7;
       ncclNetPlugin_v6 = ucxRmaPlugin_v6;
       ncclNetPlugin_v5 = ucxRmaPlugin_v5;
+      break;
+    case NCCL_P2P_UCX_UCT:
+      ncclNetPlugin_v8 = ucxUctPlugin_v8;
       break;
 #endif
     default:

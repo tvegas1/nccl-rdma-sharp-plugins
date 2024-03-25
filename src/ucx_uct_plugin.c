@@ -18,7 +18,7 @@ typedef enum {
     NCCL_UCT_START = 0,
     NCCL_UCT_CONNECT,
     NCCL_UCT_ACCEPT,
-    NCCL_UCT_SEND_RECEIVE_ADDR
+    NCCL_UCT_RECEIVE_ADDR
 } nccl_uct_state_t;
 
 typedef struct {
@@ -624,7 +624,7 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
         }
 
         NCCLCHECK(nccl_uct_comm_init(stage->comm, &context, dev));
-        stage->state = NCCL_UCT_SEND_RECEIVE_ADDR;
+        stage->state = NCCL_UCT_RECEIVE_ADDR;
         NCCLCHECK(nccl_uct_ep_addr_set(&addr, stage->comm));
         /* TODO: Add EP addresses for multiple QPs */
         NCCLCHECK(ncclSocketSend(&stage->comm->sock, &addr, sizeof(addr)));
@@ -633,8 +633,7 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
              dev, stage->comm->uct_worker, stage->comm->uct_iface,
              stage->comm->uct_ep);
         /* fallthrough */
-    case NCCL_UCT_SEND_RECEIVE_ADDR:
-
+    case NCCL_UCT_RECEIVE_ADDR:
 #if 0
       NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_SEND,
                                    stage->comm->remote_addr,
@@ -682,7 +681,7 @@ static ncclResult_t nccl_ucx_accept(void *listen_comm, void **recv_comm,
             return ncclSystemError;
         }
 
-        stage->state = NCCL_UCT_SEND_RECEIVE_ADDR;
+        stage->state = NCCL_UCT_RECEIVE_ADDR;
         NCCLCHECK(nccl_uct_ep_addr_set(&addr, comm));
         NCCLCHECK(ncclSocketSend(&comm->sock, &addr, sizeof(addr)));
 
@@ -690,7 +689,7 @@ static ncclResult_t nccl_ucx_accept(void *listen_comm, void **recv_comm,
              l_comm->dev, comm->uct_worker, comm->uct_iface, comm->uct_ep);
 
         /* fallthrough */
-    case NCCL_UCT_SEND_RECEIVE_ADDR:
+    case NCCL_UCT_RECEIVE_ADDR:
 
         break;
 

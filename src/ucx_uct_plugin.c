@@ -18,8 +18,16 @@ typedef enum {
     NCCL_UCT_START = 0,
     NCCL_UCT_CONNECT,
     NCCL_UCT_ACCEPT,
-    NCCL_UCT_RECEIVE_ADDR
+    NCCL_UCT_RECEIVE_ADDR,
+    NCCL_UCT_DONE
 } nccl_uct_state_t;
+
+/* UCT EP address to exchange and connect to */
+typedef struct {
+    uint8_t dev_addr_size;
+    uint8_t ep_addr_size;
+    uint8_t data[64]; /* TODO: Don't hardcode value, fix align */
+} nccl_uct_ep_addr_t;
 
 typedef struct {
     uct_iface_h             iface;
@@ -59,20 +67,14 @@ typedef struct {
 
     nccl_uct_iface_t        *uct_iface;
     nccl_uct_ep_t           *uct_ep;
+    nccl_uct_ep_addr_t      addr; /* remote addr */
 } nccl_uct_comm_t;
 
 typedef struct {
     nccl_uct_state_t state;
-    nccl_uct_comm_t *comm;
+    nccl_uct_comm_t  *comm;
+    int              offset;
 } nccl_uct_stage_t;
-
-/* UCT EP address to exchange and connect to */
-typedef struct {
-    uint8_t dev_addr_size;
-    uint8_t ep_addr_size;
-    uint8_t data[64]; /* TODO: Don't hardcode value */
-} nccl_uct_ep_addr_t;
-
 
 typedef uint64_t nccl_uct_tag_t;
 
@@ -138,6 +140,16 @@ static nccl_uct_tag_t nccl_uct_tag_get(nccl_uct_context_t *context, int dev)
 {
     context->tag[dev] += NCCL_UCT_TAG_SHIFT;
     return context->tag[dev];
+}
+
+static const uct_device_addr_t *nccl_uct_ep_addr_dev(nccl_uct_ep_addr_t *addr)
+{
+    return (uct_device_addr_t *)addr->data;
+}
+
+static const uct_ep_addr_t *nccl_uct_ep_addr_ep(nccl_uct_ep_addr_t *addr)
+{
+    return (uct_ep_addr_t *)(addr->data + addr->dev_addr_size);
 }
 
 static ncclResult_t nccl_uct_ep_addr_set(nccl_uct_ep_addr_t *addr,
@@ -598,12 +610,27 @@ static ncclResult_t nccl_uct_comm_init(nccl_uct_comm_t *comm,
     return ncclSuccess;
 }
 
+static ncclResult_t nccl_uct_ep_connect_to_ep(nccl_uct_ep_t *uct_ep,
+                                              nccl_uct_ep_addr_t *addr)
+{
+    ucs_status_t status = uct_ep_connect_to_ep(uct_ep->ep,
+                                               nccl_uct_ep_addr_dev(addr),
+                                               nccl_uct_ep_addr_ep(addr));
+    if (status != UCS_OK) {
+        WARN("Accept(dev=%d): failed to connect: error %d", status);
+        return ncclSystemError;
+    }
+
+    return ncclSuccess;
+}
+
 static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
                                      void **send_comm,
                                      ncclNetDeviceHandle_t** sendDevComm)
 {
     nccl_uct_listen_handle_t *handle = listen_handle;
     nccl_uct_stage_t *stage          = &handle->stage;
+    nccl_uct_comm_t *comm            = stage->comm;
     nccl_uct_ep_addr_t addr;
     int ready;
 
@@ -611,41 +638,47 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
 
     switch (stage->state) {
     case NCCL_UCT_START:
-        NCCLCHECK(ncclIbMalloc((void **)&stage->comm, sizeof(stage->comm)));
-        NCCLCHECK(ncclSocketInit(&stage->comm->sock, &handle->listener.addr,
+        NCCLCHECK(ncclIbMalloc((void **)&comm, sizeof(*comm)));
+        NCCLCHECK(ncclSocketInit(&comm->sock, &handle->listener.addr,
                                  handle->magic, ncclSocketTypeNetIb, NULL, 1));
-        NCCLCHECK(ncclSocketConnect(&stage->comm->sock));
+        NCCLCHECK(ncclSocketConnect(&comm->sock));
+        stage->comm  = comm;
         stage->state = NCCL_UCT_CONNECT;
         /* fallthrough */
     case NCCL_UCT_CONNECT:
-        NCCLCHECK(ncclSocketReady(&stage->comm->sock, &ready));
+        NCCLCHECK(ncclSocketReady(&comm->sock, &ready));
         if (!ready) {
             return ncclSuccess;
         }
 
-        NCCLCHECK(nccl_uct_comm_init(stage->comm, &context, dev));
+        NCCLCHECK(nccl_uct_comm_init(comm, &context, dev));
         stage->state = NCCL_UCT_RECEIVE_ADDR;
-        NCCLCHECK(nccl_uct_ep_addr_set(&addr, stage->comm));
+        NCCLCHECK(nccl_uct_ep_addr_set(&addr, comm));
         /* TODO: Add EP addresses for multiple QPs */
-        NCCLCHECK(ncclSocketSend(&stage->comm->sock, &addr, sizeof(addr)));
+        NCCLCHECK(ncclSocketSend(&comm->sock, &addr, sizeof(addr)));
 
         WARN("connect for dev=%d w=%p i=%p ep=%p",
-             dev, stage->comm->uct_worker, stage->comm->uct_iface,
-             stage->comm->uct_ep);
+             dev, comm->uct_worker, comm->uct_iface, comm->uct_ep);
         /* fallthrough */
     case NCCL_UCT_RECEIVE_ADDR:
-#if 0
-      NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_SEND,
-                                   stage->comm->remote_addr,
-                                   &rComm->base.sock, &rComm->base.ready, sizeof(int), &stage->offset));
-      if (stage->offset != sizeof(int)) return ncclSuccess;
-#endif
+        /* TODO: Merge connect and accept codes */
+        NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->sock,
+                                     &comm->addr, sizeof(comm->addr),
+                                     &stage->offset));
+        if (stage->offset != sizeof(comm->addr)) {
+            return ncclSuccess;
+        }
 
+        NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep, &comm->addr));
+        WARN("connect rx'd");
+        stage->state = NCCL_UCT_DONE;
+        *send_comm = comm;
         break;
+
     default:
         WARN("UCT connnect for dev=%d using unsupported state %d",
              dev, stage->state);
-        break;
+        return ncclSystemError;
     }
 
     return ncclSuccess;
@@ -659,6 +692,8 @@ static ncclResult_t nccl_ucx_accept(void *listen_comm, void **recv_comm,
     nccl_uct_comm_t *comm          = stage->comm;
     nccl_uct_ep_addr_t addr;
     int ready;
+
+    *recv_comm = NULL;
 
     switch (stage->state) {
     case NCCL_UCT_START:
@@ -690,17 +725,24 @@ static ncclResult_t nccl_ucx_accept(void *listen_comm, void **recv_comm,
 
         /* fallthrough */
     case NCCL_UCT_RECEIVE_ADDR:
+        NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->sock,
+                                     &comm->addr, sizeof(comm->addr),
+                                     &stage->offset));
+        if (stage->offset != sizeof(comm->addr)) {
+            return ncclSuccess;
+        }
 
+        NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep, &comm->addr));
+        WARN("accept rx'd");
+        stage->state = NCCL_UCT_DONE;
+        *recv_comm = comm;
         break;
 
     default:
         WARN("UCT accept for dev=%d using unsupported state %d",
              l_comm->dev, stage->state);
-
-        break;
+        return ncclSystemError;
     }
-
-    stage->comm = comm;
 
     return ncclSuccess;
 }

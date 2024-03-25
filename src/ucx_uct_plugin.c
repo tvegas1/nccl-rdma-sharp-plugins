@@ -114,7 +114,10 @@ typedef struct nccl_uct_context {
 
 static pthread_mutex_t nccl_uct_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static nccl_uct_context_t context = { .tl_name = "rx_x" };
+static nccl_uct_context_t context = {
+    .tl_name = "rc_mlx5",
+    .dev_count = -1
+};
 
 static void nccl_uct_context_init(nccl_uct_context_t *context)
 {
@@ -217,6 +220,7 @@ static uct_iface_h nccl_uct_md_iface_open(uct_worker_h worker,
         }
 
         iface = nccl_uct_resource_iface_open(worker, md, &tls[i]);
+        WARN("VEG iface open %s/%s %p", tls[i].dev_name, tls[i].tl_name, iface);
         break;
     }
     uct_release_tl_resource_list(tls);
@@ -285,12 +289,21 @@ static nccl_uct_iface_t *nccl_uct_iface_open(uct_worker_h worker,
             goto out;
         }
 
+        comp_attr.field_mask   = UCT_COMPONENT_ATTR_FIELD_MD_RESOURCES;
+        comp_attr.md_resources = alloca(sizeof(*comp_attr.md_resources) *
+                                        comp_attr.md_resource_count);
+        status = uct_component_query(*comp, &comp_attr);
+        if (status != UCS_OK) {
+            WARN("Failed to query component resources: error %d", status);
+            goto out;
+        }
+
         for (i = 0; i < comp_attr.md_resource_count; i++) {
             iface = nccl_uct_md_iface_open(worker, *comp, i,
                                            comp_attr.md_resources[i].md_name,
                                            tl_name, dev_name);
             if (iface != NULL) {
-                break;
+                goto found;
             }
         }
     }
@@ -299,6 +312,7 @@ static nccl_uct_iface_t *nccl_uct_iface_open(uct_worker_h worker,
         goto out;
     }
 
+found:
     status = uct_iface_query(iface, &iface_attr);
     if (status != UCS_OK) {
         WARN("Failed to query iface for tl_name=%s dev_name=%s",
@@ -306,16 +320,17 @@ static nccl_uct_iface_t *nccl_uct_iface_open(uct_worker_h worker,
         goto fail;
     }
 
-    uct_iface->ep_addr_size = iface_attr.ep_addr_len;
-
     uct_iface = calloc(1, sizeof(*uct_iface));
     if (uct_iface == NULL) {
         WARN("Failed to alloc uct iface structure");
         goto fail;
     }
 
+    uct_iface->ep_addr_size = iface_attr.ep_addr_len;
+
     if (iface_attr.device_addr_len > 0) {
-        uct_iface->dev_addr = calloc(1, iface_attr.device_addr_len);
+        uct_iface->dev_addr_size = iface_attr.device_addr_len;
+        uct_iface->dev_addr      = calloc(1, iface_attr.device_addr_len);
         if (uct_iface->dev_addr == NULL) {
             WARN("Failed to alloc dev_addr");
             goto fail;
@@ -330,7 +345,8 @@ static nccl_uct_iface_t *nccl_uct_iface_open(uct_worker_h worker,
     }
 
     if (iface_attr.iface_addr_len > 0) {
-        uct_iface->addr = calloc(1, iface_attr.iface_addr_len);
+        uct_iface->addr_size = iface_attr.iface_addr_len;
+        uct_iface->addr      = calloc(1, iface_attr.iface_addr_len);
         if (uct_iface->addr == NULL) {
             WARN("Failed to alloc iface addr");
             goto fail;
@@ -346,6 +362,8 @@ static nccl_uct_iface_t *nccl_uct_iface_open(uct_worker_h worker,
 
     uct_iface->iface = iface;
 
+    WARN("IFACE %p dlen %zu iface len %zu ep len %zu", iface,
+         uct_iface->dev_addr_size, uct_iface->addr_size, uct_iface->ep_addr_size);
 out:
     uct_release_component_list(comps);
     return uct_iface;
@@ -360,11 +378,12 @@ fail:
         uct_iface_close(iface);
     }
     uct_release_component_list(comps);
-    return uct_iface;
+    return NULL;
 }
 
 static ncclResult_t nccl_uct_init(ncclDebugLogger_t logFunction)
 {
+    sleep (10);
     nccl_uct_context_init(&context);
     return nccl_p2p_ib_init(&context.dev_count, ncclIbDevs, context.if_name,
                             &context.if_addr, NULL, logFunction);
@@ -380,9 +399,9 @@ static ncclResult_t nccl_uct_get_properties(int dev, ncclNetProperties_t* props)
     return nccl_p2p_ib_get_properties(ncclIbDevs, dev, props);
 }
 
-static ncclResult_t nccl_uct_worker_add(nccl_uct_worker_t *w,
-                                        nccl_uct_context_t *context,
-                                        int dev)
+static ncclResult_t nccl_uct_worker_create(nccl_uct_worker_t *w,
+                                           nccl_uct_context_t *context,
+                                           int dev)
 {
     ucs_status_t status;
 
@@ -394,7 +413,7 @@ static ncclResult_t nccl_uct_worker_add(nccl_uct_worker_t *w,
         goto fail;
     }
 
-    status = uct_worker_create(w->async, UCS_THREAD_MODE_MULTI,
+    status = uct_worker_create(w->async, UCS_THREAD_MODE_SERIALIZED,
                                &w->worker);
     if (status != UCS_OK) {
         WARN("Failed to create UCT worker: dev=%d", dev);
@@ -407,9 +426,6 @@ static ncclResult_t nccl_uct_worker_add(nccl_uct_worker_t *w,
     w->id.thread  = pthread_self();
     w->context = context;
 
-    /* Add to worker list */
-    w->next              = context->worker_list;
-    context->worker_list = w;
     return ncclSuccess;
 
 fail:
@@ -443,6 +459,12 @@ static nccl_uct_worker_t *nccl_uct_worker_get(nccl_uct_context_t *context,
         goto out;
     }
 
+    if (nccl_uct_worker_create(w, context, dev) != ncclSuccess) {
+        free(w);
+        w = NULL;
+        goto out;
+    }
+
     w->uct_iface = nccl_uct_iface_open(w->worker, context->tl_name,
                             nccl_dev_name(dev));
     if (w->uct_iface == NULL) {
@@ -450,11 +472,9 @@ static nccl_uct_worker_t *nccl_uct_worker_get(nccl_uct_context_t *context,
         goto out;
     }
 
-    if (nccl_uct_worker_add(w, context, dev) != ncclSuccess) {
-        free(w);
-        w = NULL;
-        goto out;
-    }
+    /* Add to worker list */
+    w->next              = context->worker_list;
+    context->worker_list = w;
 
 out:
     pthread_mutex_unlock(&nccl_uct_lock);
@@ -483,15 +503,16 @@ static ncclResult_t nccl_uct_listen(int dev, void *listen_handle,
     NCCLCHECK(ncclSocketListen(&comm->sock));
     NCCLCHECK(ncclSocketGetAddr(&comm->sock, &addr));
 
-    comm->context    = &context;
-    comm->dev        = dev;
-    comm->id         = context.listener_id++;
     comm->uct_worker = nccl_uct_worker_get(&context, dev);
-    comm->tag        = nccl_uct_tag_get(&context, dev);
     if (comm->uct_worker == NULL) {
         WARN("Failed to create worker for listener dev=%d", dev);
         return ncclSystemError;
     }
+
+    comm->context    = &context;
+    comm->dev        = dev;
+    comm->id         = context.listener_id++;
+    comm->tag        = nccl_uct_tag_get(&context, dev);
 
     *listen_comm = comm;
 
@@ -500,6 +521,7 @@ static ncclResult_t nccl_uct_listen(int dev, void *listen_handle,
     handle->listener.id   = comm->id;
     handle->listener.addr = addr;
 
+    WARN("Listen dev=%d ok", dev);
     return ncclSuccess;
 }
 

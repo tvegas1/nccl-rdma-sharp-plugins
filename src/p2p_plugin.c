@@ -125,7 +125,7 @@ static void pluginSetup()
 ncclResult_t pluginInit_v8(ncclDebugLogger_t logFunction) {
   pluginLogFunction = logFunction;
   pluginSetup();
-  INFO(NCCL_INIT|NCCL_NET, "P2P plugin %s", ncclNetPlugin_v8.name);
+  INFO(NCCL_INIT|NCCL_NET, "P2P plugin v8 %s", ncclNetPlugin_v8.name);
   return ncclNetPlugin_v8.init(logFunction);
 }
 

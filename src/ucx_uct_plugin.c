@@ -18,11 +18,12 @@ typedef enum {
     NCCL_UCT_START = 0,
     NCCL_UCT_CONNECT,
     NCCL_UCT_ACCEPT,
-    NCCL_UCT_SEND_ADDR
+    NCCL_UCT_SEND_RECEIVE_ADDR
 } nccl_uct_state_t;
 
 typedef struct {
     uct_iface_h             iface;
+    uct_md_h                md;
     void                    *addr;
     size_t                  addr_size;
     void                    *dev_addr;
@@ -177,7 +178,8 @@ static uct_iface_h nccl_uct_md_iface_open(uct_worker_h worker,
                                           unsigned md_index,
                                           const char *md_name,
                                           const char *tl_name,
-                                          const char *dev_name)
+                                          const char *dev_name,
+                                          uct_md_h *md_p)
 {
     uct_iface_h iface = NULL;
     ucs_status_t status;
@@ -214,23 +216,26 @@ static uct_iface_h nccl_uct_md_iface_open(uct_worker_h worker,
     }
 
     for (i = 0; i < tls_count; i++) {
-        if (strcmp(dev_name, tls[i].dev_name) ||
-            strcmp(tl_name, tls[i].tl_name)) {
-            continue;
-        }
+        if (!strcmp(dev_name, tls[i].dev_name) &&
+            !strcmp(tl_name, tls[i].tl_name)) {
 
-        iface = nccl_uct_resource_iface_open(worker, md, &tls[i]);
-        WARN("VEG iface open %s/%s %p", tls[i].dev_name, tls[i].tl_name, iface);
-        break;
+            iface = nccl_uct_resource_iface_open(worker, md, &tls[i]);
+            break;
+        }
     }
+
     uct_release_tl_resource_list(tls);
 
 out:
-    uct_md_close(md);
+    if (iface == NULL) {
+        uct_md_close(md);
+    } else {
+        *md_p = md;
+    }
     return iface;
 }
 
-nccl_uct_ep_t *nccl_uct_ep_create(nccl_uct_iface_t *uct_iface)
+static nccl_uct_ep_t *nccl_uct_ep_create(nccl_uct_iface_t *uct_iface)
 {
     nccl_uct_ep_t *uct_ep;
     ucs_status_t status;
@@ -238,6 +243,7 @@ nccl_uct_ep_t *nccl_uct_ep_create(nccl_uct_iface_t *uct_iface)
 
     uct_ep = calloc(1, sizeof(*uct_ep) + uct_iface->ep_addr_size);
     if (uct_ep == NULL) {
+        WARN("Failed to alloc EP memory");
         return NULL;
     }
 
@@ -274,6 +280,7 @@ static nccl_uct_iface_t *nccl_uct_iface_open(uct_worker_h worker,
     ucs_status_t status;
     uct_component_attr_t comp_attr;
     uct_iface_attr_t iface_attr;
+    uct_md_h md;
 
     status = uct_query_components(&comps, &comps_count);
     if (status != UCS_OK) {
@@ -301,7 +308,8 @@ static nccl_uct_iface_t *nccl_uct_iface_open(uct_worker_h worker,
         for (i = 0; i < comp_attr.md_resource_count; i++) {
             iface = nccl_uct_md_iface_open(worker, *comp, i,
                                            comp_attr.md_resources[i].md_name,
-                                           tl_name, dev_name);
+                                           tl_name, dev_name,
+                                           &md);
             if (iface != NULL) {
                 goto found;
             }
@@ -320,6 +328,11 @@ found:
         goto fail;
     }
 
+    if (!(iface_attr.cap.flags & UCT_IFACE_FLAG_CONNECT_TO_EP)) {
+        WARN("Interface flag CONNECT_TO_EP is not set");
+        goto fail;
+    }
+
     uct_iface = calloc(1, sizeof(*uct_iface));
     if (uct_iface == NULL) {
         WARN("Failed to alloc uct iface structure");
@@ -327,6 +340,7 @@ found:
     }
 
     uct_iface->ep_addr_size = iface_attr.ep_addr_len;
+    uct_iface->md           = md;
 
     if (iface_attr.device_addr_len > 0) {
         uct_iface->dev_addr_size = iface_attr.device_addr_len;
@@ -547,6 +561,11 @@ static ncclResult_t nccl_uct_comm_init(nccl_uct_comm_t *comm,
     }
 
     comm->uct_iface  = comm->uct_worker->uct_iface;
+    comm->uct_ep     = nccl_uct_ep_create(comm->uct_iface);
+    if (comm->uct_ep == NULL) {
+        return ncclSystemError;
+    }
+
     return ncclSuccess;
 }
 
@@ -568,18 +587,20 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
         NCCLCHECK(ncclSocketConnect(&stage->comm->sock));
         stage->state = NCCL_UCT_CONNECT;
         /* fallthrough */
-    case NCCL_UCT_SEND_ADDR:
+    case NCCL_UCT_CONNECT:
         NCCLCHECK(ncclSocketReady(&stage->comm->sock, &ready));
         if (!ready) {
             return ncclSuccess;
         }
 
         NCCLCHECK(nccl_uct_comm_init(stage->comm, &context, dev));
-        stage->state = NCCL_UCT_SEND_ADDR;
+        stage->state = NCCL_UCT_SEND_RECEIVE_ADDR;
         /* fallthrough */
-     case NCCL_UCT_CONNECT:
-        WARN("Loop connect state from dev=%d", dev);
-        for (;;);
+        WARN("connect for dev=%d w=%p i=%p ep=%p",
+             dev, stage->comm->uct_worker, stage->comm->uct_iface,
+             stage->comm->uct_ep);
+    case NCCL_UCT_SEND_RECEIVE_ADDR:
+
 #if 0
       NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_SEND,
                                    stage->comm->remote_addr,
@@ -621,12 +642,17 @@ static ncclResult_t nccl_ucx_accept(void *listen_comm, void **recv_comm,
         comm->context    = l_comm->context;
         comm->uct_worker = l_comm->uct_worker;
         comm->uct_iface  = comm->uct_worker->uct_iface;
-        WARN("accepted for dev=%d", l_comm->dev);
+        comm->uct_ep     = nccl_uct_ep_create(comm->uct_iface);
+        if (comm->uct_ep == NULL) {
+            return ncclSystemError;
+        }
 
-        stage->state = NCCL_UCT_SEND_ADDR;
+        WARN("accepted for dev=%d w=%p i=%p ep=%p",
+             l_comm->dev, comm->uct_worker, comm->uct_iface, comm->uct_ep);
+
+        stage->state = NCCL_UCT_SEND_RECEIVE_ADDR;
         /* fallthrough */
-    case NCCL_UCT_SEND_ADDR:
-        for (;;);
+    case NCCL_UCT_SEND_RECEIVE_ADDR:
 
         break;
 

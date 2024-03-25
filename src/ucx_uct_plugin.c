@@ -46,10 +46,9 @@ typedef struct nccl_uct_worker {
 
 typedef struct {
     uct_ep_h                ep;
-    void                    *addr;
+    uct_ep_addr_t           *addr;
     size_t                  addr_size;
     nccl_uct_iface_t        *uct_iface;
-    uct_ep_addr_t           *ep_addr;
     uint8_t                 data[];
 } nccl_uct_ep_t;
 
@@ -66,6 +65,14 @@ typedef struct {
     nccl_uct_state_t state;
     nccl_uct_comm_t *comm;
 } nccl_uct_stage_t;
+
+/* UCT EP address to exchange and connect to */
+typedef struct {
+    uint8_t dev_addr_size;
+    uint8_t ep_addr_size;
+    uint8_t data[64]; /* TODO: Don't hardcode value */
+} nccl_uct_ep_addr_t;
+
 
 typedef uint64_t nccl_uct_tag_t;
 
@@ -131,6 +138,28 @@ static nccl_uct_tag_t nccl_uct_tag_get(nccl_uct_context_t *context, int dev)
 {
     context->tag[dev] += NCCL_UCT_TAG_SHIFT;
     return context->tag[dev];
+}
+
+static ncclResult_t nccl_uct_ep_addr_set(nccl_uct_ep_addr_t *addr,
+                                         const nccl_uct_comm_t *comm)
+{
+    nccl_uct_iface_t *uct_iface = comm->uct_iface;
+    size_t total                = uct_iface->dev_addr_size +
+                                  uct_iface->ep_addr_size;
+
+    if (total > sizeof(addr->data)) {
+        WARN("Address sizes are too big (%zu + %u > %zu)",
+             uct_iface->dev_addr_size, uct_iface->ep_addr_size);
+        return ncclSystemError;
+    }
+
+    addr->dev_addr_size = uct_iface->dev_addr_size;
+    addr->ep_addr_size  = uct_iface->ep_addr_size;
+
+    memcpy(addr->data, uct_iface->dev_addr, addr->dev_addr_size);
+    memcpy(addr->data + addr->dev_addr_size, comm->uct_ep->addr,
+           uct_iface->ep_addr_size);
+    return ncclSuccess;
 }
 
 static uct_iface_h nccl_uct_resource_iface_open(uct_worker_h worker,
@@ -247,7 +276,7 @@ static nccl_uct_ep_t *nccl_uct_ep_create(nccl_uct_iface_t *uct_iface)
         return NULL;
     }
 
-    uct_ep->ep_addr = (uct_ep_addr_t *)uct_ep->data;
+    uct_ep->addr = (uct_ep_addr_t *)uct_ep->data;
 
     ep_params.field_mask = UCT_EP_PARAM_FIELD_IFACE;
     ep_params.iface      = uct_iface->iface;
@@ -259,7 +288,7 @@ static nccl_uct_ep_t *nccl_uct_ep_create(nccl_uct_iface_t *uct_iface)
         return NULL;
     }
 
-    status = uct_ep_get_address(uct_ep->ep, uct_ep->ep_addr);
+    status = uct_ep_get_address(uct_ep->ep, uct_ep->addr);
     if (status != UCS_OK) {
         WARN("Failed to get UCT EP address: error %d", status);
         free(uct_ep);
@@ -575,6 +604,7 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
 {
     nccl_uct_listen_handle_t *handle = listen_handle;
     nccl_uct_stage_t *stage          = &handle->stage;
+    nccl_uct_ep_addr_t addr;
     int ready;
 
     *send_comm = NULL;
@@ -595,10 +625,14 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
 
         NCCLCHECK(nccl_uct_comm_init(stage->comm, &context, dev));
         stage->state = NCCL_UCT_SEND_RECEIVE_ADDR;
-        /* fallthrough */
+        NCCLCHECK(nccl_uct_ep_addr_set(&addr, stage->comm));
+        /* TODO: Add EP addresses for multiple QPs */
+        NCCLCHECK(ncclSocketSend(&stage->comm->sock, &addr, sizeof(addr)));
+
         WARN("connect for dev=%d w=%p i=%p ep=%p",
              dev, stage->comm->uct_worker, stage->comm->uct_iface,
              stage->comm->uct_ep);
+        /* fallthrough */
     case NCCL_UCT_SEND_RECEIVE_ADDR:
 
 #if 0
@@ -624,6 +658,7 @@ static ncclResult_t nccl_ucx_accept(void *listen_comm, void **recv_comm,
     nccl_uct_listen_comm_t *l_comm = listen_comm;
     nccl_uct_stage_t *stage        = &l_comm->stage;
     nccl_uct_comm_t *comm          = stage->comm;
+    nccl_uct_ep_addr_t addr;
     int ready;
 
     switch (stage->state) {
@@ -647,10 +682,13 @@ static ncclResult_t nccl_ucx_accept(void *listen_comm, void **recv_comm,
             return ncclSystemError;
         }
 
+        stage->state = NCCL_UCT_SEND_RECEIVE_ADDR;
+        NCCLCHECK(nccl_uct_ep_addr_set(&addr, comm));
+        NCCLCHECK(ncclSocketSend(&comm->sock, &addr, sizeof(addr)));
+
         WARN("accepted for dev=%d w=%p i=%p ep=%p",
              l_comm->dev, comm->uct_worker, comm->uct_iface, comm->uct_ep);
 
-        stage->state = NCCL_UCT_SEND_RECEIVE_ADDR;
         /* fallthrough */
     case NCCL_UCT_SEND_RECEIVE_ADDR:
 

@@ -49,7 +49,6 @@ typedef struct nccl_uct_worker {
     ucs_async_context_t     *async;
     uct_worker_h            worker;
     struct nccl_uct_context *context;
-    nccl_uct_iface_t        *uct_iface;
 } nccl_uct_worker_t;
 
 typedef struct {
@@ -93,7 +92,7 @@ typedef struct {
     int                     dev;
     uint32_t                id;
     struct ncclSocket       sock;
-    nccl_uct_tag_t          tag;
+    nccl_uct_tag_t          tag; /* TODO: Are we able to remove that tag? */
     nccl_uct_worker_t       *uct_worker;
     struct nccl_uct_context *context;
 
@@ -310,12 +309,13 @@ static nccl_uct_ep_t *nccl_uct_ep_create(nccl_uct_iface_t *uct_iface)
     return uct_ep;
 }
 
-static nccl_uct_iface_t *nccl_uct_iface_open(uct_worker_h worker,
+static nccl_uct_iface_t *nccl_uct_iface_open(nccl_uct_worker_t *uct_worker,
                                              const char *tl_name,
                                              const char *dev_name)
 {
+    uct_worker_h worker         = uct_worker->worker; 
     nccl_uct_iface_t *uct_iface = NULL;
-    uct_iface_h iface          = NULL;
+    uct_iface_h iface           = NULL;
     uct_component_h *comps, *comp;
     unsigned comps_count, i;
     ucs_status_t status;
@@ -358,6 +358,8 @@ static nccl_uct_iface_t *nccl_uct_iface_open(uct_worker_h worker,
     }
 
     if (iface == NULL) {
+        WARN("Failed to open iface for tl_name=%s dev_name=%s",
+             tl_name, dev_name);
         goto out;
     }
 
@@ -520,12 +522,15 @@ static nccl_uct_worker_t *nccl_uct_worker_get(nccl_uct_context_t *context,
         goto out;
     }
 
-    w->uct_iface = nccl_uct_iface_open(w->worker, context->tl_name,
-                            nccl_dev_name(dev));
-    if (w->uct_iface == NULL) {
-        w = NULL; /* TODO fix leak */
-        goto out;
-    }
+#if 0
+    if (1) {
+        status = uct_iface_set_am_handler(w->uct_iface.iface, NCCL_UCT_AM_RTR,
+                                          nccl_uct_am_rtr_handler,
+
+                                          hello_world,
+617                                       &cmd_args.func_am_type, 0);
+#endif
+
 
     /* Add to worker list */
     w->next              = context->worker_list;
@@ -601,7 +606,12 @@ static ncclResult_t nccl_uct_comm_init(nccl_uct_comm_t *comm,
         return ncclSystemError;
     }
 
-    comm->uct_iface  = comm->uct_worker->uct_iface;
+    comm->uct_iface = nccl_uct_iface_open(comm->uct_worker, context->tl_name,
+                            nccl_dev_name(dev));
+    if (comm->uct_iface == NULL) {
+        return ncclSystemError;
+    }
+
     comm->uct_ep     = nccl_uct_ep_create(comm->uct_iface);
     if (comm->uct_ep == NULL) {
         return ncclSystemError;
@@ -710,7 +720,13 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
 
         comm->context    = l_comm->context;
         comm->uct_worker = l_comm->uct_worker;
-        comm->uct_iface  = comm->uct_worker->uct_iface;
+        comm->uct_iface  = nccl_uct_iface_open(comm->uct_worker,
+                                               comm->context->tl_name,
+                                               nccl_dev_name(l_comm->dev));
+        if (comm->uct_iface == NULL) {
+            return ncclSystemError;
+        }
+
         comm->uct_ep     = nccl_uct_ep_create(comm->uct_iface);
         if (comm->uct_ep == NULL) {
             return ncclSystemError;
@@ -772,7 +788,7 @@ static ncclResult_t nccl_uct_reg_mr(void *reg_comm, void *data, size_t size,
     size  = (size + NCCL_UCT_REG_ALIGN - 1) & ~(NCCL_UCT_REG_ALIGN - 1);
     addr &= ~(NCCL_UCT_REG_ALIGN - 1);
 
-    status = uct_md_mem_reg(md, (void *)addr, size, UCT_MD_MEM_ACCESS_RMA,
+    status = uct_md_mem_reg(md, (void *)addr, size, UCT_MD_MEM_ACCESS_ALL,
                             &uct_memh->memh);
     if (status != UCS_OK) {
         WARN("Failed to register %p/%zu on comm %p", addr, size, comm);
@@ -811,7 +827,7 @@ static ncclResult_t nccl_uct_dereg_mr(void *dereg_comm, void *mhandle)
     return ncclSuccess;
 }
 
-static ncclResult_t nccl_ucx_irecv(void *recv_comm, int n, void **data,
+static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
                                    int *sizes, int *tags, void **mhandle,
                                    void **request)
 {
@@ -822,6 +838,7 @@ static ncclResult_t nccl_ucx_irecv(void *recv_comm, int n, void **data,
         return ncclInternalError;
     }
 
+    (void)status;
     return ncclSuccess;
 }
 

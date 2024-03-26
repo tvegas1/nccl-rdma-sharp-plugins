@@ -120,6 +120,13 @@ typedef struct {
     int              offset;
 } nccl_uct_stage_t;
 
+/* Memory registration handle in NCCL UCT plugin */
+typedef struct {
+    uct_mem_h memh;
+    nccl_uct_comm_t *comm;
+    uint8_t rkey[];
+} nccl_uct_memh_t;
+
 typedef uint64_t nccl_uct_tag_t;
 
 /* Passed around by NCCL */
@@ -164,6 +171,7 @@ typedef struct nccl_uct_context {
 
 #define NCCL_UCT_LISTEN_HANDLE_MAGIC 0x43cf19ed91abdb85
 
+#define NCCL_UCT_MAGIC 0x59ab18e432ad73da
 #define NCCL_UCT_TAG_SHIFT 0x100
 
 static pthread_mutex_t nccl_uct_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -354,10 +362,111 @@ static nccl_uct_ep_t *nccl_uct_ep_create(nccl_uct_iface_t *uct_iface)
     return uct_ep;
 }
 
+/* TODO: Use ring buffer of rdesc pointers instead */
+static nccl_uct_rdesc_t *
+nccl_uct_comm_rdesc_get(nccl_uct_comm_t *comm)
+{
+    nccl_uct_rdesc_t *rdesc = comm->free_rdesc;
+
+    if (rdesc == NULL) {
+        rdesc = calloc(1, sizeof(*rdesc));
+    } else {
+        comm->free_rdesc = rdesc->next;
+    }
+
+    rdesc->next = NULL;
+    rdesc->comm = comm;
+
+    if (comm->rdesc_list.tail != NULL) {
+        rdesc->pprev = &comm->rdesc_list.tail->next;
+        comm->rdesc_list.tail->next = rdesc;
+    } else {
+        rdesc->pprev = &comm->rdesc_list.head;
+        comm->rdesc_list.head = rdesc;
+    }
+
+    comm->rdesc_list.tail = rdesc;
+
+    return rdesc;
+}
+
+static void nccl_uct_comm_rdesc_put(nccl_uct_rdesc_t *rdesc)
+{
+    nccl_uct_comm_t *comm = rdesc->comm;
+
+    assert(comm != NULL);
+
+    *rdesc->pprev = rdesc->next;
+    if (rdesc->next != NULL) {
+        rdesc->next->pprev = rdesc->pprev;
+    }
+
+    rdesc->next      = comm->free_rdesc;
+    rdesc->comm      = NULL;
+    comm->free_rdesc = rdesc;
+}
+
+static size_t nccl_uct_rdesc_size(int n)
+{
+    return n * sizeof(nccl_uct_chunk_t) + sizeof(nccl_uct_rdesc_hdr_t);
+}
+
+static void nccl_uct_recv_desc_pack(nccl_uct_rdesc_hdr_t *desc,
+                                    uint64_t id, int n, void **data,
+                                    int *sizes, int *tags,
+                                    nccl_uct_memh_t **uct_memh)
+{
+    int i;
+    size_t rkey_size = uct_memh[0]->comm->uct_iface->rkey_packed_size;
+
+    assert(rkey_size <= sizeof(desc->chunk[0].rkey));
+
+    desc->id    = id;
+    desc->done  = 0;
+    desc->count = n;
+    desc->size  = nccl_uct_rdesc_size(n);
+
+    for (i = 0; i < n; i++) {
+        desc->chunk[i].tag  = tags[i];
+        desc->chunk[i].size = sizes[i];
+        desc->chunk[i].data = data[i];
+        memcpy(desc->chunk[i].rkey, uct_memh[i]->rkey, rkey_size);
+    }
+}
+
 static ucs_status_t nccl_uct_rtr_callback(void *arg, void *data, size_t length,
                                           unsigned flags)
 {
+    nccl_uct_comm_t *comm      = arg;
+    nccl_uct_rdesc_t *rdesc    = nccl_uct_comm_rdesc_get(comm);
+    uint64_t magic             = *(uint64_t *)data;
+    nccl_uct_rdesc_hdr_t *desc = data + sizeof(uint64_t);
+    size_t size                = desc->size;
+
+    if (rdesc == NULL) {
+        WARN("Failed to get an rdesc in RTR callback");
+        return UCS_OK;
+
+    }
+
+    if (magic != NCCL_UCT_MAGIC) {
+        WARN("RTR Bad magic: 0x%08x", magic);
+        goto skip;
+    }
+
+    length -= sizeof(uint64_t);
+    if ((size != length) || (size != nccl_uct_rdesc_size(desc->count))) {
+        WARN("RTR Bad sizes: rdesc.count=%d (%zuB) rdesc.size=%d length=%zu",
+             desc->count, nccl_uct_rdesc_size(desc->count),
+             desc->size, length);
+        goto skip;
+    }
+
     WARN("RX RTR: length %zu comm %p", length, arg);
+    return UCS_OK;
+
+skip:
+    nccl_uct_comm_rdesc_put(rdesc);
     return UCS_OK;
 }
 
@@ -847,13 +956,6 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
     return ncclSuccess;
 }
 
-/* Memory registration handle in NCCL UCT plugin */
-typedef struct {
-    uct_mem_h memh;
-    nccl_uct_comm_t *comm;
-    uint8_t rkey[];
-} nccl_uct_memh_t;
-
 #define NCCL_UCT_REG_ALIGN 4096
 
 static ncclResult_t nccl_uct_reg_mr(void *reg_comm, void *data, size_t size,
@@ -930,74 +1032,6 @@ static ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
     return ncclSuccess;
 }
 
-static size_t nccl_uct_recv_desc_size(int n)
-{
-    return n * sizeof(nccl_uct_chunk_t) + sizeof(nccl_uct_rdesc_hdr_t);
-}
-
-static void nccl_uct_recv_desc_pack(nccl_uct_rdesc_hdr_t *desc,
-                                    uint64_t id, int n, void **data,
-                                    int *sizes, int *tags, 
-                                    nccl_uct_memh_t **uct_memh)
-{
-    int i;
-    size_t rkey_size = uct_memh[0]->comm->uct_iface->rkey_packed_size;
-
-    assert(rkey_size <= sizeof(desc->chunk[0].rkey));
-
-    desc->id    = id;
-    desc->done  = 0;
-    desc->count = n;
-    desc->size  = nccl_uct_recv_desc_size(n);
-
-    for (i = 0; i < n; i++) {
-        desc->chunk[i].tag  = tags[i];
-        desc->chunk[i].size = sizes[i];
-        desc->chunk[i].data = data[i];
-        memcpy(desc->chunk[i].rkey, uct_memh[i]->rkey, rkey_size);
-    }
-}
-
-/* TODO: Use ring buffer of rdesc pointers instead */
-static nccl_uct_rdesc_t *
-nccl_uct_comm_rdesc_get(nccl_uct_comm_t *comm)
-{
-    nccl_uct_rdesc_t *rdesc = comm->free_rdesc;
-
-    if (rdesc == NULL) {
-        rdesc = calloc(1, sizeof(*rdesc));
-    } else {
-        comm->free_rdesc = rdesc->next;
-    }
-
-    rdesc->next = NULL;
-    rdesc->comm = comm;
-
-    if (comm->rdesc_list.tail != NULL) {
-        rdesc->pprev = &comm->rdesc_list.tail->next;
-        comm->rdesc_list.tail->next = rdesc;
-    } else {
-        rdesc->pprev = &comm->rdesc_list.head;
-    }
-
-    comm->rdesc_list.tail = rdesc;
-
-    return rdesc;
-}
-
-static void nccl_uct_comm_rdesc_put(nccl_uct_rdesc_t *rdesc)
-{
-    nccl_uct_comm_t *comm = rdesc->comm;
-
-    *rdesc->pprev = rdesc->next;
-    if (rdesc->next != NULL) {
-        rdesc->next->pprev = rdesc->pprev;
-    }
-
-    rdesc->next       = comm->free_rdesc;
-    comm->free_rdesc = rdesc;
-}
-
 /*
  * Sender side:
  * 1. perform series of put, ack when all of them have completed
@@ -1010,7 +1044,7 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
     nccl_uct_comm_t *comm      = recv_comm;
     nccl_uct_ep_t *uct_ep      = comm->uct_ep;
     nccl_uct_memh_t **uct_memh = (nccl_uct_memh_t **)mhandles;
-    size_t length              = nccl_uct_recv_desc_size(n);
+    size_t length              = nccl_uct_rdesc_size(n);
     nccl_uct_rdesc_t *rdesc;
     uint64_t id;
     ucs_status_t status;
@@ -1020,7 +1054,7 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
 
     /*
      * Receiver side:
-     * 1. Prepare uct receive 
+     * 1. Prepare uct receive
      * 2. Use packed key from mhandle
      * 3. Send or early return
      * 4. Return as a request
@@ -1035,7 +1069,9 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
     id = 0x234;
     nccl_uct_recv_desc_pack(&rdesc->desc, id, n, data, sizes, tags, uct_memh);
 
-    status = uct_ep_am_short(uct_ep->ep, NCCL_UCT_AM_RTR, 0, &rdesc->desc, length);
+    WARN("VEG length %zu", length);
+    status = uct_ep_am_short(uct_ep->ep, NCCL_UCT_AM_RTR, NCCL_UCT_MAGIC,
+                             &rdesc->desc, length);
     if (status != UCS_OK) {
         nccl_uct_comm_rdesc_put(rdesc);
         rdesc = NULL;

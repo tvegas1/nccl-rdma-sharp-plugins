@@ -857,10 +857,19 @@ static ncclResult_t nccl_uct_dereg_mr(void *dereg_comm, void *mhandle)
     return ncclSuccess;
 }
 
+static ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
+                                   int tag, void *mhandle, void **request)
+{
+    nccl_uct_comm_t *comm = send_comm;
+    uct_worker_progress(comm->uct_worker->worker);
+    return ncclSuccess;
+}
+
 static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
                                    int *sizes, int *tags, void **mhandle,
                                    void **request)
 {
+    nccl_uct_comm_t *comm = recv_comm;
     ucs_status_t status;
 
     if (n > NCCL_NET_IB_MAX_RECVS) {
@@ -868,7 +877,11 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
         return ncclInternalError;
     }
 
-    (void)status;
+    status = uct_ep_am_short(comm->uct_ep->ep, NCCL_UCT_AM_RTR, 0x1, "testit", 7);
+    if (status != UCS_OK) {
+        WARN("SEND FAILED comm %p", comm);
+    }
+    uct_worker_progress(comm->uct_worker->worker);
     return ncclSuccess;
 }
 
@@ -883,7 +896,7 @@ ncclNet_v8_t ucxUctPlugin_v8 = {
     .regMr         = nccl_uct_reg_mr,
     .regMrDmaBuf   = nccl_uct_reg_mr_dmabuf,
     .deregMr       = nccl_uct_dereg_mr,
-    .isend = NULL,
+    .isend         = nccl_uct_isend,
     .irecv         = nccl_uct_irecv,
     .iflush = NULL,
     .test = NULL,

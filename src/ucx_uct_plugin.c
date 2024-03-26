@@ -42,6 +42,9 @@ typedef struct {
     void                    *dev_addr;
     size_t                  dev_addr_size;
     size_t                  ep_addr_size;
+    size_t                  rkey_packed_size;
+
+    size_t                  am_max_short;
 } nccl_uct_iface_t;
 
 typedef struct nccl_uct_worker {
@@ -72,6 +75,8 @@ typedef struct {
     nccl_uct_iface_t        *uct_iface;
     nccl_uct_ep_t           *uct_ep;
     nccl_uct_ep_addr_t      addr; /* remote addr */
+
+    nccl_uct_recv_desc_storage_t *free_rdesc;;
 } nccl_uct_comm_t;
 
 typedef struct {
@@ -359,6 +364,7 @@ static nccl_uct_iface_t *nccl_uct_iface_open(nccl_uct_worker_t *uct_worker,
     uct_component_attr_t comp_attr;
     uct_iface_attr_t iface_attr;
     uct_md_h md;
+    uct_md_attr_t md_attr;
 
     status = uct_query_components(&comps, &comps_count);
     if (status != UCS_OK) {
@@ -413,6 +419,12 @@ found:
         goto fail;
     }
 
+    status = uct_md_query(md, &md_attr);
+    if (status != UCS_OK) {
+        WARN("Failed to query md for iface %p: error %d", iface, status);
+        goto fail;
+    }
+
     uct_iface = calloc(1, sizeof(*uct_iface));
     if (uct_iface == NULL) {
         WARN("Failed to alloc uct iface structure");
@@ -421,6 +433,12 @@ found:
 
     uct_iface->ep_addr_size = iface_attr.ep_addr_len;
     uct_iface->md           = md;
+
+    if (iface_attr.cap.flags & UCT_IFACE_FLAG_AM_SHORT) {
+        uct_iface->am_max_short = iface_attr.cap.am.max_short;
+    }
+
+    uct_iface->rkey_packed_size = md_attr.rkey_packed_size;
 
     if (iface_attr.device_addr_len > 0) {
         uct_iface->dev_addr_size = iface_attr.device_addr_len;
@@ -456,8 +474,9 @@ found:
 
     uct_iface->iface = iface;
 
-    WARN("IFACE %p dlen %zu iface len %zu ep len %zu", iface,
-         uct_iface->dev_addr_size, uct_iface->addr_size, uct_iface->ep_addr_size);
+    WARN("IFACE %p dlen %zu iface len %zu ep len %zu am_max_short %zu rkey_packed_size %zu", iface,
+         uct_iface->dev_addr_size, uct_iface->addr_size, uct_iface->ep_addr_size,
+         uct_iface->am_max_short, uct_iface->rkey_packed_size);
 out:
     uct_release_component_list(comps);
     return uct_iface;
@@ -797,6 +816,7 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
 typedef struct {
     uct_mem_h memh;
     nccl_uct_comm_t *comm;
+    uint8_t rkey[];
 } nccl_uct_memh_t;
 
 #define NCCL_UCT_REG_ALIGN 4096
@@ -807,10 +827,11 @@ static ncclResult_t nccl_uct_reg_mr(void *reg_comm, void *data, size_t size,
     nccl_uct_comm_t *comm = reg_comm;
     uct_md_h md           = comm->uct_iface->md;
     intptr_t addr         = (intptr_t)data;
+    size_t rkey_size      = comm->uct_iface->rkey_packed_size;
     nccl_uct_memh_t *uct_memh;
     ucs_status_t status;
 
-    NCCLCHECK(ncclIbMalloc((void **)&uct_memh, sizeof(*uct_memh)));
+    NCCLCHECK(ncclIbMalloc((void **)&uct_memh, sizeof(*uct_memh) + rkey_size));
     uct_memh->comm = comm;
 
     /* Use integral pages */
@@ -818,10 +839,18 @@ static ncclResult_t nccl_uct_reg_mr(void *reg_comm, void *data, size_t size,
     size  = (size + NCCL_UCT_REG_ALIGN - 1) & ~(NCCL_UCT_REG_ALIGN - 1);
     addr &= ~(NCCL_UCT_REG_ALIGN - 1);
 
+    /* Register memory */
     status = uct_md_mem_reg(md, (void *)addr, size, UCT_MD_MEM_ACCESS_ALL,
                             &uct_memh->memh);
     if (status != UCS_OK) {
         WARN("Failed to register %p/%zu on comm %p", addr, size, comm);
+        return ncclSystemError;
+    }
+
+    /* Pack memory */
+    status = uct_md_mkey_pack(md, uct_memh->memh, uct_memh->rkey);
+    if (status != UCS_OK) {
+        WARN("Failed to pack rkey for %p/%zu on comm %p", addr, size, comm);
         return ncclSystemError;
     }
 
@@ -854,6 +883,7 @@ static ncclResult_t nccl_uct_dereg_mr(void *dereg_comm, void *mhandle)
         return ncclSystemError;
     }
 
+    free(uct_memh);
     return ncclSuccess;
 }
 
@@ -865,22 +895,100 @@ static ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
     return ncclSuccess;
 }
 
+typedef struct nccl_uct_recv_desc {
+    struct nccl_uct_receive *next;
+    uint64_t id;
+    int i, n;
+    int tag[NCCL_NET_IB_MAX_RECVS];
+    int sizes[NCCL_NET_IB_MAX_RECVS];
+    void *data[NCCL_NET_IB_MAX_RECVS];
+    void *mhandle[NCCL_NET_IB_MAX_RECVS];
+} nccl_uct_receive_t;
+
+typedef struct {
+    int tag;
+    int size;
+    void *data;
+    uint8_t rkey[16]; /* TODO: Support bigger sizes */
+} nccl_uct_chunk_t;
+
+typedef struct {
+    uint64_t id;
+    uint16_t done;
+    uint16_t count;
+    uint32_t size;
+    nccl_uct_chunk_t chunk[];
+} nccl_uct_recv_desc_t;
+
+typedef struct {
+    nccl_uct_recv_desc_t rdesc;
+    nccl_uct_chunk_t     chunk[NCCL_NET_IB_MAX_RECVS];
+} nccl_uct_recv_desc_storage_t;
+
+static size_t nccl_uct_recv_desc_size(int n)
+{
+    return n * sizeof(nccl_uct_chunk_t) + sizeof(nccl_uct_recv_desc_t);
+}
+
+static void nccl_uct_recv_desc_pack(nccl_uct_recv_desc_t *rdesc,
+                                    uint64_t id, int n, void **data, int *sizes,
+                                    int *tags, nccl_uct_memh_t **uct_memh)
+{
+    int i;
+    size_t rkey_size = uct_memh[0]->comm->uct_iface->rkey_packed_size;
+
+    assert(rkey_size <= sizeof(rdesc->chunk[0].rkey));
+
+    rdesc->id    = id;
+    rdesc->done  = 0;
+    rdesc->count = n;
+    rdesc->size  = nccl_uct_recv_desc_size(n);
+
+    for (i = 0; i < n; i++) {
+        rdesc->chunk[i].tag  = tags[i];
+        rdesc->chunk[i].size = sizes[i];
+        rdesc->chunk[i].data = data[i];
+        memcpy(rdesc->chunk[i].rkey, uct_memh[i]->rkey, rkey_size);
+    }
+}
+
+/*
+ * Sender side:
+ * 1. perform series of put, ack when all of them have completed
+ */
+
 static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
-                                   int *sizes, int *tags, void **mhandle,
+                                   int *sizes, int *tags, void **mhandles,
                                    void **request)
 {
-    nccl_uct_comm_t *comm = recv_comm;
+    nccl_uct_comm_t *comm      = recv_comm;
+    nccl_uct_memh_t **uct_memh = (nccl_uct_memh_t **)mhandles;
+    nccl_uct_recv_desc_storage_t *desc;
+    size_t length              = nccl_uct_recv_desc_size(n);
+    uint64_t id;
     ucs_status_t status;
 
-    if (n > NCCL_NET_IB_MAX_RECVS) {
-        WARN("uct_irecv failed: n %d > %d", n, NCCL_NET_IB_MAX_RECVS);
-        return ncclInternalError;
+    assert(n <= NCCL_NET_IB_MAX_RECVS);
+    assert(length <= comm->uct_iface->am_max_short);
+
+    /*
+     * Receiver side:
+     * 1. Prepare uct receive 
+     * 2. Use packed key from mhandle
+     * 3. Send or early return
+     * 4. Create a request
+     */
+
+    id = 0x234;
+    nccl_uct_recv_desc_pack(&desc.rdesc, id, n, data, sizes, tags, uct_memh);
+
+    status = uct_ep_am_short(comm->uct_ep->ep, NCCL_UCT_AM_RTR, 0,
+                             &desc, length);
+    if (status == UCS_OK) {
+    } else {
+        *request = NULL;
     }
 
-    status = uct_ep_am_short(comm->uct_ep->ep, NCCL_UCT_AM_RTR, 0x1, "testit", 7);
-    if (status != UCS_OK) {
-        WARN("SEND FAILED comm %p", comm);
-    }
     uct_worker_progress(comm->uct_worker->worker);
     return ncclSuccess;
 }

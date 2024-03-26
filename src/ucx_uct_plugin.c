@@ -22,6 +22,11 @@ typedef enum {
     NCCL_UCT_DONE
 } nccl_uct_state_t;
 
+typedef enum {
+    NCCL_UCT_AM_RTR = 14,
+    NCCL_UCT_AM_ATP = 15,
+} nccl_uct_am_type_t;
+
 /* UCT EP address to exchange and connect to */
 typedef struct {
     uint8_t dev_addr_size;
@@ -309,11 +314,43 @@ static nccl_uct_ep_t *nccl_uct_ep_create(nccl_uct_iface_t *uct_iface)
     return uct_ep;
 }
 
+static ucs_status_t nccl_uct_rtr_callback(void *arg, void *data, size_t length,
+                                          unsigned flags)
+{
+    WARN("RX RTR: length %zu comm %p", length, arg);
+    return UCS_OK;
+}
+
+static ncclResult_t nccl_uct_iface_set_handler(nccl_uct_iface_t *uct_iface,
+                                               int id,
+                                               uct_am_callback_t callback,
+                                               nccl_uct_comm_t *comm)
+{
+    ucs_status_t status = uct_iface_set_am_handler(uct_iface->iface,
+                                                   id, callback, comm, 0);
+    if (status != UCS_OK) {
+        WARN("Failed to get AM handler id=%d comm=%p", id, comm, status);
+        return ncclInternalError;
+    }
+
+    return ncclSuccess;
+}
+
+static ncclResult_t nccl_uct_iface_set_rtr_mode(nccl_uct_iface_t *uct_iface,
+                                                nccl_uct_comm_t *comm)
+{
+    ncclResult_t result;
+
+    result = nccl_uct_iface_set_handler(uct_iface, NCCL_UCT_AM_RTR,
+                                        nccl_uct_rtr_callback, comm);
+    return result;
+}
+
 static nccl_uct_iface_t *nccl_uct_iface_open(nccl_uct_worker_t *uct_worker,
                                              const char *tl_name,
                                              const char *dev_name)
 {
-    uct_worker_h worker         = uct_worker->worker; 
+    uct_worker_h worker         = uct_worker->worker;
     nccl_uct_iface_t *uct_iface = NULL;
     uct_iface_h iface           = NULL;
     uct_component_h *comps, *comp;
@@ -522,16 +559,6 @@ static nccl_uct_worker_t *nccl_uct_worker_get(nccl_uct_context_t *context,
         goto out;
     }
 
-#if 0
-    if (1) {
-        status = uct_iface_set_am_handler(w->uct_iface.iface, NCCL_UCT_AM_RTR,
-                                          nccl_uct_am_rtr_handler,
-
-                                          hello_world,
-617                                       &cmd_args.func_am_type, 0);
-#endif
-
-
     /* Add to worker list */
     w->next              = context->worker_list;
     context->worker_list = w;
@@ -612,7 +639,9 @@ static ncclResult_t nccl_uct_comm_init(nccl_uct_comm_t *comm,
         return ncclSystemError;
     }
 
-    comm->uct_ep     = nccl_uct_ep_create(comm->uct_iface);
+    NCCLCHECK(nccl_uct_iface_set_rtr_mode(comm->uct_iface, comm));
+
+    comm->uct_ep = nccl_uct_ep_create(comm->uct_iface);
     if (comm->uct_ep == NULL) {
         return ncclSystemError;
     }
@@ -726,6 +755,7 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
         if (comm->uct_iface == NULL) {
             return ncclSystemError;
         }
+        NCCLCHECK(nccl_uct_iface_set_rtr_mode(comm->uct_iface, comm));
 
         comm->uct_ep     = nccl_uct_ep_create(comm->uct_iface);
         if (comm->uct_ep == NULL) {

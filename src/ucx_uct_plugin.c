@@ -23,7 +23,7 @@ typedef enum {
 } nccl_uct_state_t;
 
 typedef enum {
-    NCCL_UCT_AM_RTR = 14,
+    NCCL_UCT_AM_RTR = 14, /* Use particular values */
     NCCL_UCT_AM_ATP = 15,
 } nccl_uct_am_type_t;
 
@@ -82,17 +82,19 @@ typedef struct {
     uint16_t count;
     uint32_t size;
     nccl_uct_chunk_t chunk[];
-} nccl_uct_recv_desc_t;
+} nccl_uct_rdesc_hdr_t;
 
 struct nccl_uct_comm;
 
 /* Pending receive descriptor either on the receive or sending side */
-typedef struct nccl_uct_recv_desc_storage {
-    struct nccl_uct_recv_desc_storage *next;
-    struct nccl_uct_comm              *comm;
-    nccl_uct_recv_desc_t              rdesc;
-    nccl_uct_chunk_t                  chunk[NCCL_NET_IB_MAX_RECVS];
-} nccl_uct_recv_desc_storage_t;
+typedef struct nccl_uct_rdesc {
+    struct nccl_uct_rdesc **pprev;
+    struct nccl_uct_rdesc *next;
+
+    struct nccl_uct_comm  *comm;
+    nccl_uct_rdesc_hdr_t  desc;
+    nccl_uct_chunk_t      storage[NCCL_NET_IB_MAX_RECVS];
+} nccl_uct_rdesc_t;
 
 typedef struct nccl_uct_comm {
     struct ncclSocket       sock;
@@ -103,8 +105,13 @@ typedef struct nccl_uct_comm {
     nccl_uct_ep_t           *uct_ep;
     nccl_uct_ep_addr_t      addr; /* remote addr */
 
-    nccl_uct_recv_desc_storage_t *free_rdesc; /* Available rdesc for reuse */
-    nccl_uct_recv_desc_storage_t *rdesc;      /* Pending rdesc, either rx/tx */
+    nccl_uct_rdesc_t        *free_rdesc; /* Available rdesc for reuse */
+
+    /* Pending rdesc, either rx/tx */
+    struct {
+        nccl_uct_rdesc_t    *head;
+        nccl_uct_rdesc_t    *tail;
+    } rdesc_list;
 } nccl_uct_comm_t;
 
 typedef struct {
@@ -925,52 +932,70 @@ static ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
 
 static size_t nccl_uct_recv_desc_size(int n)
 {
-    return n * sizeof(nccl_uct_chunk_t) + sizeof(nccl_uct_recv_desc_t);
+    return n * sizeof(nccl_uct_chunk_t) + sizeof(nccl_uct_rdesc_hdr_t);
 }
 
-static void nccl_uct_recv_desc_pack(nccl_uct_recv_desc_t *rdesc,
-                                    uint64_t id, int n, void **data, int *sizes,
-                                    int *tags, nccl_uct_memh_t **uct_memh)
+static void nccl_uct_recv_desc_pack(nccl_uct_rdesc_hdr_t *desc,
+                                    uint64_t id, int n, void **data,
+                                    int *sizes, int *tags, 
+                                    nccl_uct_memh_t **uct_memh)
 {
     int i;
     size_t rkey_size = uct_memh[0]->comm->uct_iface->rkey_packed_size;
 
-    assert(rkey_size <= sizeof(rdesc->chunk[0].rkey));
+    assert(rkey_size <= sizeof(desc->chunk[0].rkey));
 
-    rdesc->id    = id;
-    rdesc->done  = 0;
-    rdesc->count = n;
-    rdesc->size  = nccl_uct_recv_desc_size(n);
+    desc->id    = id;
+    desc->done  = 0;
+    desc->count = n;
+    desc->size  = nccl_uct_recv_desc_size(n);
 
     for (i = 0; i < n; i++) {
-        rdesc->chunk[i].tag  = tags[i];
-        rdesc->chunk[i].size = sizes[i];
-        rdesc->chunk[i].data = data[i];
-        memcpy(rdesc->chunk[i].rkey, uct_memh[i]->rkey, rkey_size);
+        desc->chunk[i].tag  = tags[i];
+        desc->chunk[i].size = sizes[i];
+        desc->chunk[i].data = data[i];
+        memcpy(desc->chunk[i].rkey, uct_memh[i]->rkey, rkey_size);
     }
 }
 
-static nccl_uct_recv_desc_storage_t *
+/* TODO: Use ring buffer of rdesc pointers instead */
+static nccl_uct_rdesc_t *
 nccl_uct_comm_rdesc_get(nccl_uct_comm_t *comm)
 {
-    nccl_uct_recv_desc_storage_t *desc = comm->free_rdesc;
+    nccl_uct_rdesc_t *rdesc = comm->free_rdesc;
 
-    if (desc == NULL) {
-        return calloc(1, sizeof(*desc));
+    if (rdesc == NULL) {
+        rdesc = calloc(1, sizeof(*rdesc));
+    } else {
+        comm->free_rdesc = rdesc->next;
     }
 
-    comm->free_rdesc = desc->next;
-    desc->next       = NULL;
-    desc->comm       = comm;
-    return desc;
+    rdesc->next = NULL;
+    rdesc->comm = comm;
+
+    if (comm->rdesc_list.tail != NULL) {
+        rdesc->pprev = &comm->rdesc_list.tail->next;
+        comm->rdesc_list.tail->next = rdesc;
+    } else {
+        rdesc->pprev = &comm->rdesc_list.head;
+    }
+
+    comm->rdesc_list.tail = rdesc;
+
+    return rdesc;
 }
 
-static void nccl_uct_comm_rdesc_put(nccl_uct_recv_desc_storage_t *desc)
+static void nccl_uct_comm_rdesc_put(nccl_uct_rdesc_t *rdesc)
 {
-    nccl_uct_comm_t *comm = desc->comm;
+    nccl_uct_comm_t *comm = rdesc->comm;
 
-    desc->next       = comm->free_rdesc;
-    comm->free_rdesc = desc;
+    *rdesc->pprev = rdesc->next;
+    if (rdesc->next != NULL) {
+        rdesc->next->pprev = rdesc->pprev;
+    }
+
+    rdesc->next       = comm->free_rdesc;
+    comm->free_rdesc = rdesc;
 }
 
 /*
@@ -985,8 +1010,8 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
     nccl_uct_comm_t *comm      = recv_comm;
     nccl_uct_ep_t *uct_ep      = comm->uct_ep;
     nccl_uct_memh_t **uct_memh = (nccl_uct_memh_t **)mhandles;
-    nccl_uct_recv_desc_storage_t *desc;
     size_t length              = nccl_uct_recv_desc_size(n);
+    nccl_uct_rdesc_t *rdesc;
     uint64_t id;
     ucs_status_t status;
 
@@ -998,25 +1023,25 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
      * 1. Prepare uct receive 
      * 2. Use packed key from mhandle
      * 3. Send or early return
-     * 4. Create a request
+     * 4. Return as a request
      */
 
-    desc = nccl_uct_comm_rdesc_get(comm);
-    if (desc == NULL) {
+    rdesc = nccl_uct_comm_rdesc_get(comm);
+    if (rdesc == NULL) {
         WARN("Failed to get an rdesc");
         return ncclInternalError;
     }
 
     id = 0x234;
-    nccl_uct_recv_desc_pack(&desc->rdesc, id, n, data, sizes, tags, uct_memh);
+    nccl_uct_recv_desc_pack(&rdesc->desc, id, n, data, sizes, tags, uct_memh);
 
-    status = uct_ep_am_short(uct_ep->ep, NCCL_UCT_AM_RTR, 0, &desc, length);
+    status = uct_ep_am_short(uct_ep->ep, NCCL_UCT_AM_RTR, 0, &rdesc->desc, length);
     if (status != UCS_OK) {
-        nccl_uct_comm_rdesc_put(desc);
-        desc = NULL;
+        nccl_uct_comm_rdesc_put(rdesc);
+        rdesc = NULL;
     }
 
-    *request = desc;
+    *request = rdesc;
 
     uct_worker_progress(comm->uct_worker->worker);
     return ncclSuccess;

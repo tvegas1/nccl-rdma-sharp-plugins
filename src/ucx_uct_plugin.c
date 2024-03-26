@@ -67,7 +67,34 @@ typedef struct {
     uint8_t                 data[];
 } nccl_uct_ep_t;
 
+/* On-the-wire descriptor of a posted receive request entry */
 typedef struct {
+    int tag;
+    int size;
+    void *data;
+    uint8_t rkey[16]; /* TODO: Support bigger sizes */
+} nccl_uct_chunk_t;
+
+/* On-the-wire descriptor of a receive request containing many chunks */
+typedef struct {
+    uint64_t id;
+    uint16_t done;
+    uint16_t count;
+    uint32_t size;
+    nccl_uct_chunk_t chunk[];
+} nccl_uct_recv_desc_t;
+
+struct nccl_uct_comm;
+
+/* Pending receive descriptor either on the receive or sending side */
+typedef struct nccl_uct_recv_desc_storage {
+    struct nccl_uct_recv_desc_storage *next;
+    struct nccl_uct_comm              *comm;
+    nccl_uct_recv_desc_t              rdesc;
+    nccl_uct_chunk_t                  chunk[NCCL_NET_IB_MAX_RECVS];
+} nccl_uct_recv_desc_storage_t;
+
+typedef struct nccl_uct_comm {
     struct ncclSocket       sock;
     struct nccl_uct_context *context;
     nccl_uct_worker_t       *uct_worker;
@@ -76,7 +103,8 @@ typedef struct {
     nccl_uct_ep_t           *uct_ep;
     nccl_uct_ep_addr_t      addr; /* remote addr */
 
-    nccl_uct_recv_desc_storage_t *free_rdesc;;
+    nccl_uct_recv_desc_storage_t *free_rdesc; /* Available rdesc for reuse */
+    nccl_uct_recv_desc_storage_t *rdesc;      /* Pending rdesc, either rx/tx */
 } nccl_uct_comm_t;
 
 typedef struct {
@@ -895,36 +923,6 @@ static ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
     return ncclSuccess;
 }
 
-typedef struct nccl_uct_recv_desc {
-    struct nccl_uct_receive *next;
-    uint64_t id;
-    int i, n;
-    int tag[NCCL_NET_IB_MAX_RECVS];
-    int sizes[NCCL_NET_IB_MAX_RECVS];
-    void *data[NCCL_NET_IB_MAX_RECVS];
-    void *mhandle[NCCL_NET_IB_MAX_RECVS];
-} nccl_uct_receive_t;
-
-typedef struct {
-    int tag;
-    int size;
-    void *data;
-    uint8_t rkey[16]; /* TODO: Support bigger sizes */
-} nccl_uct_chunk_t;
-
-typedef struct {
-    uint64_t id;
-    uint16_t done;
-    uint16_t count;
-    uint32_t size;
-    nccl_uct_chunk_t chunk[];
-} nccl_uct_recv_desc_t;
-
-typedef struct {
-    nccl_uct_recv_desc_t rdesc;
-    nccl_uct_chunk_t     chunk[NCCL_NET_IB_MAX_RECVS];
-} nccl_uct_recv_desc_storage_t;
-
 static size_t nccl_uct_recv_desc_size(int n)
 {
     return n * sizeof(nccl_uct_chunk_t) + sizeof(nccl_uct_recv_desc_t);
@@ -952,6 +950,29 @@ static void nccl_uct_recv_desc_pack(nccl_uct_recv_desc_t *rdesc,
     }
 }
 
+static nccl_uct_recv_desc_storage_t *
+nccl_uct_comm_rdesc_get(nccl_uct_comm_t *comm)
+{
+    nccl_uct_recv_desc_storage_t *desc = comm->free_rdesc;
+
+    if (desc == NULL) {
+        return calloc(1, sizeof(*desc));
+    }
+
+    comm->free_rdesc = desc->next;
+    desc->next       = NULL;
+    desc->comm       = comm;
+    return desc;
+}
+
+static void nccl_uct_comm_rdesc_put(nccl_uct_recv_desc_storage_t *desc)
+{
+    nccl_uct_comm_t *comm = desc->comm;
+
+    desc->next       = comm->free_rdesc;
+    comm->free_rdesc = desc;
+}
+
 /*
  * Sender side:
  * 1. perform series of put, ack when all of them have completed
@@ -962,6 +983,7 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
                                    void **request)
 {
     nccl_uct_comm_t *comm      = recv_comm;
+    nccl_uct_ep_t *uct_ep      = comm->uct_ep;
     nccl_uct_memh_t **uct_memh = (nccl_uct_memh_t **)mhandles;
     nccl_uct_recv_desc_storage_t *desc;
     size_t length              = nccl_uct_recv_desc_size(n);
@@ -979,15 +1001,22 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
      * 4. Create a request
      */
 
-    id = 0x234;
-    nccl_uct_recv_desc_pack(&desc.rdesc, id, n, data, sizes, tags, uct_memh);
-
-    status = uct_ep_am_short(comm->uct_ep->ep, NCCL_UCT_AM_RTR, 0,
-                             &desc, length);
-    if (status == UCS_OK) {
-    } else {
-        *request = NULL;
+    desc = nccl_uct_comm_rdesc_get(comm);
+    if (desc == NULL) {
+        WARN("Failed to get an rdesc");
+        return ncclInternalError;
     }
+
+    id = 0x234;
+    nccl_uct_recv_desc_pack(&desc->rdesc, id, n, data, sizes, tags, uct_memh);
+
+    status = uct_ep_am_short(uct_ep->ep, NCCL_UCT_AM_RTR, 0, &desc, length);
+    if (status != UCS_OK) {
+        nccl_uct_comm_rdesc_put(desc);
+        desc = NULL;
+    }
+
+    *request = desc;
 
     uct_worker_progress(comm->uct_worker->worker);
     return ncclSuccess;

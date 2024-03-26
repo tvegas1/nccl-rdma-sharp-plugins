@@ -125,7 +125,7 @@ typedef struct nccl_uct_context {
 static pthread_mutex_t nccl_uct_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static nccl_uct_context_t context = {
-    .tl_name = "rc_mlx5",
+    .tl_name   = "rc_mlx5",
     .dev_count = -1
 };
 
@@ -684,7 +684,7 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
     return ncclSuccess;
 }
 
-static ncclResult_t nccl_ucx_accept(void *listen_comm, void **recv_comm,
+static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
                              ncclNetDeviceHandle_v7_t** recvDevComm)
 {
     nccl_uct_listen_comm_t *l_comm = listen_comm;
@@ -747,6 +747,84 @@ static ncclResult_t nccl_ucx_accept(void *listen_comm, void **recv_comm,
     return ncclSuccess;
 }
 
+/* Memory registration handle in NCCL UCT plugin */
+typedef struct {
+    uct_mem_h memh;
+    nccl_uct_comm_t *comm;
+} nccl_uct_memh_t;
+
+#define NCCL_UCT_REG_ALIGN 4096
+
+static ncclResult_t nccl_uct_reg_mr(void *reg_comm, void *data, size_t size,
+                                    int type, void **mhandle)
+{
+    nccl_uct_comm_t *comm = reg_comm;
+    uct_md_h md           = comm->uct_iface->md;
+    intptr_t addr         = (intptr_t)data;
+    nccl_uct_memh_t *uct_memh;
+    ucs_status_t status;
+
+    NCCLCHECK(ncclIbMalloc((void **)&uct_memh, sizeof(*uct_memh)));
+    uct_memh->comm = comm;
+
+    /* Use integral pages */
+    size += addr & (NCCL_UCT_REG_ALIGN - 1);
+    size  = (size + NCCL_UCT_REG_ALIGN - 1) & ~(NCCL_UCT_REG_ALIGN - 1);
+    addr &= ~(NCCL_UCT_REG_ALIGN - 1);
+
+    status = uct_md_mem_reg(md, (void *)addr, size, UCT_MD_MEM_ACCESS_RMA,
+                            &uct_memh->memh);
+    if (status != UCS_OK) {
+        WARN("Failed to register %p/%zu on comm %p", addr, size, comm);
+        return ncclSystemError;
+    }
+
+    *mhandle = uct_memh;
+    return ncclSuccess;
+}
+
+static ncclResult_t nccl_uct_reg_mr_dmabuf(void *reg_comm, void *data,
+                                           size_t size, int type,
+                                           uint64_t offset, int fd,
+                                           void **mhandle)
+{
+    /* TODO: Use mem reg v2 with DMABUF flag? */
+    return nccl_uct_reg_mr(reg_comm, data, size, type, mhandle);
+}
+
+static ncclResult_t nccl_uct_dereg_mr(void *dereg_comm, void *mhandle)
+{
+    nccl_uct_comm_t *comm     = dereg_comm;
+    nccl_uct_memh_t *uct_memh = mhandle;
+    ucs_status_t status;
+
+    assert(uct_memh->memh != UCT_MEM_HANDLE_NULL);
+    assert(uct_memh->comm == comm);
+
+    status = uct_md_mem_dereg(comm->uct_iface->md, uct_memh->memh);
+    if (status != UCS_OK) {
+        WARN("Failed to deregister memh %p on comm %p: error %d",
+             uct_memh, comm, status);
+        return ncclSystemError;
+    }
+
+    return ncclSuccess;
+}
+
+static ncclResult_t nccl_ucx_irecv(void *recv_comm, int n, void **data,
+                                   int *sizes, int *tags, void **mhandle,
+                                   void **request)
+{
+    ucs_status_t status;
+
+    if (n > NCCL_NET_IB_MAX_RECVS) {
+        WARN("uct_irecv failed: n %d > %d", n, NCCL_NET_IB_MAX_RECVS);
+        return ncclInternalError;
+    }
+
+    return ncclSuccess;
+}
+
 ncclNet_v8_t ucxUctPlugin_v8 = {
     .name          = "UCX-UCT",
     .init          = nccl_uct_init,
@@ -754,12 +832,12 @@ ncclNet_v8_t ucxUctPlugin_v8 = {
     .getProperties = nccl_uct_get_properties,
     .listen        = nccl_uct_listen,
     .connect       = nccl_uct_connect,
-    .accept        = nccl_ucx_accept,
-    .regMr = NULL,
-    .regMrDmaBuf = NULL,
-    .deregMr = NULL,
+    .accept        = nccl_uct_accept,
+    .regMr         = nccl_uct_reg_mr,
+    .regMrDmaBuf   = nccl_uct_reg_mr_dmabuf,
+    .deregMr       = nccl_uct_dereg_mr,
     .isend = NULL,
-    .irecv = NULL,
+    .irecv         = nccl_uct_irecv,
     .iflush = NULL,
     .test = NULL,
     .closeSend = NULL,

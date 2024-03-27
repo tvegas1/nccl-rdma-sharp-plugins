@@ -37,6 +37,7 @@ typedef struct {
 typedef struct {
     uct_iface_h             iface;
     uct_md_h                md;
+    uct_component_h         comp;
     void                    *addr;
     size_t                  addr_size;
     void                    *dev_addr;
@@ -72,28 +73,33 @@ typedef struct {
     int tag;
     int size;
     void *data;
+    int done;
     uint8_t rkey[16]; /* TODO: Support bigger sizes */
 } nccl_uct_chunk_t;
 
+struct nccl_uct_rdesc;
+
 /* On-the-wire descriptor of a receive request containing many chunks */
 typedef struct {
-    uint64_t id;
-    uint16_t done;
-    uint16_t count;
-    uint32_t size;
-    nccl_uct_chunk_t chunk[];
+    uint64_t              id;
+    uint16_t              count;
+    uint32_t              size;
+    struct nccl_uct_rdesc *peer_rdesc; /* Acts as a cookie along with id */
+    nccl_uct_chunk_t      chunk[];
 } nccl_uct_rdesc_hdr_t;
 
 struct nccl_uct_comm;
 
 /* Pending receive descriptor either on the receive or sending side */
 typedef struct nccl_uct_rdesc {
+    uct_completion_t      completion; /* Keep it first */
+    int                   send_atp;
     struct nccl_uct_rdesc **pprev;
     struct nccl_uct_rdesc *next;
 
     struct nccl_uct_comm  *comm;
     nccl_uct_rdesc_hdr_t  desc;
-    nccl_uct_chunk_t      storage[NCCL_NET_IB_MAX_RECVS];
+    nccl_uct_chunk_t      storage[NCCL_NET_IB_MAX_RECVS]; /* Don't use */
 } nccl_uct_rdesc_t;
 
 typedef struct nccl_uct_comm {
@@ -106,6 +112,7 @@ typedef struct nccl_uct_comm {
     nccl_uct_ep_addr_t      addr; /* remote addr */
 
     nccl_uct_rdesc_t        *free_rdesc; /* Available rdesc for reuse */
+    uint64_t                rdesc_id; 
 
     /* Pending rdesc, either rx/tx */
     struct {
@@ -164,7 +171,7 @@ typedef struct nccl_uct_context {
 
     uint32_t                listener_id; /* Listener ID allocation */
 
-    nccl_uct_worker_t       *worker_list; /* List of instanciated workers */
+    nccl_uct_worker_t       *worker_list; /* List of instantiated workers */
 
     nccl_uct_tag_t          tag[MAX_IB_DEVS];
 } nccl_uct_context_t;
@@ -374,8 +381,9 @@ nccl_uct_comm_rdesc_get(nccl_uct_comm_t *comm)
         comm->free_rdesc = rdesc->next;
     }
 
-    rdesc->next = NULL;
-    rdesc->comm = comm;
+    rdesc->next     = NULL;
+    rdesc->send_atp = 0;
+    rdesc->comm     = comm;
 
     if (comm->rdesc_list.tail != NULL) {
         rdesc->pprev = &comm->rdesc_list.tail->next;
@@ -411,25 +419,40 @@ static size_t nccl_uct_rdesc_size(int n)
     return n * sizeof(nccl_uct_chunk_t) + sizeof(nccl_uct_rdesc_hdr_t);
 }
 
-static void nccl_uct_recv_desc_pack(nccl_uct_rdesc_hdr_t *desc,
-                                    uint64_t id, int n, void **data,
-                                    int *sizes, int *tags,
-                                    nccl_uct_memh_t **uct_memh)
+static void nccl_uct_completion_callback(uct_completion_t *comp)
 {
+    assert(comp->count == 0);
+}
+
+static void nccl_uct_completion_init(uct_completion_t *completion, int count)
+{
+    completion->func   = nccl_uct_completion_callback;
+    completion->count  = count;
+    completion->status = UCS_OK;
+}
+
+static void nccl_uct_recv_desc_set(nccl_uct_rdesc_t *rdesc,
+                                   uint64_t id, int n, void **data,
+                                   int *sizes, int *tags,
+                                   nccl_uct_memh_t **uct_memh)
+{
+    size_t rkey_size           = uct_memh[0]->comm->uct_iface->rkey_packed_size;
+    nccl_uct_rdesc_hdr_t *desc = &rdesc->desc;
     int i;
-    size_t rkey_size = uct_memh[0]->comm->uct_iface->rkey_packed_size;
 
     assert(rkey_size <= sizeof(desc->chunk[0].rkey));
 
-    desc->id    = id;
-    desc->done  = 0;
-    desc->count = n;
-    desc->size  = nccl_uct_rdesc_size(n);
+    desc->id         = id;
+    desc->count      = n;
+    desc->size       = nccl_uct_rdesc_size(n);
+    desc->peer_rdesc = rdesc;
+    nccl_uct_completion_init(&rdesc->completion, 1);
 
     for (i = 0; i < n; i++) {
         desc->chunk[i].tag  = tags[i];
         desc->chunk[i].size = sizes[i];
         desc->chunk[i].data = data[i];
+        desc->chunk[i].done = 0;
         memcpy(desc->chunk[i].rkey, uct_memh[i]->rkey, rkey_size);
     }
 }
@@ -462,7 +485,11 @@ static ucs_status_t nccl_uct_rtr_callback(void *arg, void *data, size_t length,
         goto skip;
     }
 
-    WARN("RX RTR: length %zu comm %p", length, arg);
+    nccl_uct_completion_init(&rdesc->completion, desc->count + 1);
+    rdesc->send_atp = 1;
+    memcpy(&rdesc->desc, desc, size);
+    //WARN("RX RTR: rem_rdesc=%p id=%lu n=%u tag[0]=0x%x", desc->peer_rdesc, desc->id, desc->count, rdesc->desc.chunk[0].tag);
+
     return UCS_OK;
 
 skip:
@@ -577,6 +604,7 @@ found:
 
     uct_iface->ep_addr_size = iface_attr.ep_addr_len;
     uct_iface->md           = md;
+    uct_iface->comp         = *comp;
 
     if (iface_attr.cap.flags & UCT_IFACE_FLAG_AM_SHORT) {
         uct_iface->am_max_short = iface_attr.cap.am.max_short;
@@ -1024,12 +1052,85 @@ static ncclResult_t nccl_uct_dereg_mr(void *dereg_comm, void *mhandle)
     return ncclSuccess;
 }
 
+static ncclResult_t nccl_uct_send(nccl_uct_comm_t *comm, void *data, int size,
+                                  nccl_uct_memh_t *uct_memh,
+                                  nccl_uct_rdesc_t *rdesc, int i,
+                                  void **request)
+{
+    uct_component_h comp = comm->uct_iface->comp;
+    uct_rkey_bundle_t bundle;
+    ucs_status_t status, rkey_status;
+    uct_iov_t iov;
+
+    *request = NULL;
+
+    /* Get remote key */
+    status = uct_rkey_unpack(comp, rdesc->desc.chunk[i].rkey, &bundle);
+    if (status != UCS_OK) {
+        WARN("Failed to unpacked rkey: error %d", status);
+        return ncclInternalError;
+    }
+
+    /* Details for local data */
+    iov.buffer = data;
+    iov.length = size;
+    iov.memh   = uct_memh->memh;
+    iov.stride = iov.length;
+    iov.count  = 1;
+
+    status = uct_ep_put_zcopy(comm->uct_ep->ep, &iov, 1, (uint64_t)data,
+                              bundle.rkey, &rdesc->completion);
+
+    rkey_status = uct_rkey_release(comp, &bundle);
+    if (rkey_status != UCS_OK) {
+        WARN("Failed to release rkey bundle: error %d", rkey_status);
+    }
+
+    if (status == UCS_OK) {
+        rdesc->completion.count--;
+    } else if (status != UCS_INPROGRESS) {
+        WARN("Failed to PUT: error %d", status);
+        return ncclSuccess;
+    }
+
+    rdesc->desc.chunk[i].done = 1;
+    *request = &rdesc->completion;
+    return ncclSuccess;
+}
+
 static ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
                                    int tag, void *mhandle, void **request)
 {
-    nccl_uct_comm_t *comm = send_comm;
+    nccl_uct_comm_t *comm     = send_comm;
+    nccl_uct_memh_t *uct_memh = mhandle;
+    nccl_uct_rdesc_t *rdesc;
+    ncclResult_t result;
+    int i;
+
+    *request = NULL;
+
+    for (rdesc = comm->rdesc_list.head; rdesc != NULL; rdesc = rdesc->next) {
+        for (i = 0; i < rdesc->desc.count; i++) {
+            if (!rdesc->desc.chunk[i].done &&
+                (rdesc->desc.chunk[i].tag == tag)) {
+                goto found;
+            }
+        }
+    }
+
+    if (rdesc == NULL) {
+        WARN("VEG isend: no match for tag 0x%x", tag);
+        goto out;
+    }
+
+found:
+    WARN("VEG isend: rdesc tag 0x%x matched peer_rdesc=%p",
+         tag, rdesc->desc.peer_rdesc);
+
+    result = nccl_uct_send(comm, data, size, uct_memh, rdesc, i, request);
+out:
     uct_worker_progress(comm->uct_worker->worker);
-    return ncclSuccess;
+    return result;
 }
 
 /*
@@ -1066,20 +1167,49 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
         return ncclInternalError;
     }
 
-    id = 0x234;
-    nccl_uct_recv_desc_pack(&rdesc->desc, id, n, data, sizes, tags, uct_memh);
+    id = comm->rdesc_id++;
+    nccl_uct_recv_desc_set(rdesc, id, n, data, sizes, tags, uct_memh);
 
-    WARN("VEG length %zu", length);
     status = uct_ep_am_short(uct_ep->ep, NCCL_UCT_AM_RTR, NCCL_UCT_MAGIC,
                              &rdesc->desc, length);
     if (status != UCS_OK) {
         nccl_uct_comm_rdesc_put(rdesc);
         rdesc = NULL;
+    } else {
+        WARN("VEG irecv: rdesc=%p n=%d tag[0]=%d", rdesc, n, tags[0]);
     }
 
     *request = rdesc;
 
     uct_worker_progress(comm->uct_worker->worker);
+    return ncclSuccess;
+}
+
+static ncclResult_t nccl_uct_test(void *request, int *done, int *size)
+{
+    nccl_uct_rdesc_t *rdesc = request;
+    nccl_uct_comm_t *comm   = rdesc->comm;
+    ucs_status_t status;
+
+    while (uct_worker_progress(comm->uct_worker->worker));
+
+    if (rdesc->send_atp && rdesc->completion.count == 1) {
+        status = uct_ep_am_short(comm->uct_ep->ep, NCCL_UCT_AM_ATP,
+                                 NCCL_UCT_MAGIC, &rdesc->desc.peer_rdesc,
+                                 sizeof(rdesc->desc.peer_rdesc));
+
+        if (status == UCS_OK) {
+            rdesc->completion.count--;
+        }
+    }
+
+    if (rdesc->completion.count == 0) {
+        *done = 1;
+        nccl_uct_comm_rdesc_put(rdesc);
+    } else {
+        *done = 0;
+    }
+
     return ncclSuccess;
 }
 
@@ -1097,7 +1227,7 @@ ncclNet_v8_t ucxUctPlugin_v8 = {
     .isend         = nccl_uct_isend,
     .irecv         = nccl_uct_irecv,
     .iflush = NULL,
-    .test = NULL,
+    .test          = nccl_uct_test,
     .closeSend = NULL,
     .closeRecv = NULL,
     .closeListen   = nccl_uct_close_listen,

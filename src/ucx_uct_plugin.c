@@ -110,7 +110,7 @@ typedef struct nccl_uct_rdesc {
     int                   nccl_usage; /* NCCL requests not finished/started */
     int                   send_atp;
 
-    struct nccl_uct_rdesc **pprev; /* comm's linked list */
+    struct nccl_uct_rdesc *prev; /* comm's linked list */
     struct nccl_uct_rdesc *next;
 
     struct nccl_uct_comm  *comm;
@@ -410,10 +410,11 @@ nccl_uct_comm_rdesc_get(nccl_uct_comm_t *comm)
     rdesc->comm     = comm;
 
     if (comm->rdesc_list.tail != NULL) {
-        rdesc->pprev = &comm->rdesc_list.tail->next;
+        rdesc->prev = comm->rdesc_list.tail;
         comm->rdesc_list.tail->next = rdesc;
     } else {
-        rdesc->pprev = &comm->rdesc_list.head;
+        assert(comm->rdesc_list.head == NULL);
+        rdesc->prev = NULL;
         comm->rdesc_list.head = rdesc;
     }
 
@@ -428,14 +429,22 @@ static void nccl_uct_comm_rdesc_put(nccl_uct_rdesc_t *rdesc)
 
     assert(comm != NULL);
 
-    *rdesc->pprev = rdesc->next;
+    if (rdesc->prev != NULL) {
+        rdesc->prev->next = rdesc->next;
+    }
     if (rdesc->next != NULL) {
-        rdesc->next->pprev = rdesc->pprev;
+        rdesc->next->prev = rdesc->prev;
+    }
+    if (rdesc == comm->rdesc_list.head) {
+        comm->rdesc_list.head = rdesc->next;
+    }
+    if (rdesc == comm->rdesc_list.tail) {
+        comm->rdesc_list.tail = rdesc->prev;
     }
 
     rdesc->desc.id   = -1;
-    rdesc->next      = comm->free_rdesc;
     rdesc->comm      = NULL;
+    rdesc->next      = comm->free_rdesc;
     comm->free_rdesc = rdesc;
 }
 
@@ -538,7 +547,7 @@ static ucs_status_t nccl_uct_rtr_callback(void *arg, void *data, size_t length,
     rdesc->send_atp   = 1;
     nccl_uct_completion_init(&rdesc->completion, desc->count + 1);
 
-    WARN("RX RTR: rem_rdesc=%p id=%lu n=%u tag[0]=0x%x", desc->peer_rdesc, desc->id, desc->count, rdesc->desc.chunk[0].tag);
+    WARN("RX RTR: comm=%p rem_rdesc=%p id=%lu n=%u tag[0]=0x%x", comm, desc->peer_rdesc, desc->id, desc->count, rdesc->desc.chunk[0].tag);
 
     return UCS_OK;
 }
@@ -1200,12 +1209,14 @@ static ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
     nccl_uct_comm_t *comm     = send_comm;
     nccl_uct_memh_t *uct_memh = mhandle;
     nccl_uct_rdesc_t *rdesc;
-    ncclResult_t result;
+    ncclResult_t result = ncclSuccess;
     int i;
+    WARN("ISEND comm=%p %p/%zu tag %d", comm, data, size, tag);
 
     *request = NULL;
 
     for (rdesc = comm->rdesc_list.head; rdesc != NULL; rdesc = rdesc->next) {
+        WARN(" Try rdesc=%p count=%d", rdesc, rdesc->desc.count);
         for (i = 0; i < rdesc->desc.count; i++) {
             if (!rdesc->desc.chunk[i].done &&
                 (rdesc->desc.chunk[i].tag == tag)) {
@@ -1219,10 +1230,10 @@ static ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
     }
 
 found:
-    WARN("VEG isend: rdesc tag 0x%x size=%d matched peer_rdesc=%p",
-         tag, size, rdesc->desc.peer_rdesc);
 
     result = nccl_uct_send(comm, data, size, uct_memh, rdesc, i, request);
+    WARN("VEG isend: rdesc tag 0x%x size=%d matched peer_rdesc=%p request=%p",
+         tag, size, rdesc->desc.peer_rdesc, *request);
 out:
     uct_worker_progress(comm->uct_worker->worker);
     return result;
@@ -1271,8 +1282,8 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
         *request = NULL;
     } else {
         *request = nccl_uct_rdesc_get_req(rdesc, 0, -1); /* receive request */
-        WARN("VEG irecv: rdesc=%p n=%d tag[0]=%d sizes[0]=%d",
-             rdesc, n, tags[0], sizes[0]);
+        WARN("VEG irecv: rdesc=%p id=%d n=%d tag[0]=%d sizes[0]=%d",
+             rdesc, rdesc->desc.id, n, tags[0], sizes[0]);
     }
 
     uct_worker_progress(comm->uct_worker->worker);
@@ -1311,6 +1322,7 @@ static ncclResult_t nccl_uct_test(void *request, int *done, int *sizes)
     nccl_uct_rdesc_t *rdesc = req->rdesc;
     nccl_uct_comm_t *comm   = rdesc->comm;
 
+    WARN("TEST %p", request);
     while (uct_worker_progress(comm->uct_worker->worker));
 
     if (rdesc->send_atp && rdesc->completion.count == 1) {
@@ -1345,7 +1357,7 @@ static ncclResult_t nccl_uct_test(void *request, int *done, int *sizes)
     if (--rdesc->nccl_usage < 1) {
         assert(rdesc->nccl_usage == 0);
         nccl_uct_comm_rdesc_put(rdesc);
-        WARN("TEST done rdesc=%p", rdesc);
+        WARN("TEST done %p rdesc=%p", request, rdesc);
     }
 
     return ncclSuccess;

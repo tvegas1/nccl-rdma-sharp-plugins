@@ -123,6 +123,12 @@ typedef struct nccl_uct_rdesc {
     int                   sizes[NCCL_UCX_UCT_MAX_RECVS];   /* ATP received sizes */
 } nccl_uct_rdesc_t;
 
+/* All the remote addresses for the communicator */
+typedef struct nccl_uct_comm_addr {
+    nccl_uct_ep_addr_t      rma;
+    nccl_uct_ep_addr_t      am;
+} nccl_uct_comm_addr_t;
+
 typedef struct nccl_uct_comm {
     struct ncclSocket       sock;
     struct nccl_uct_context *context;
@@ -130,7 +136,8 @@ typedef struct nccl_uct_comm {
 
     nccl_uct_iface_t        *uct_iface;
     nccl_uct_ep_t           *uct_ep;
-    nccl_uct_ep_addr_t      addr; /* remote addr */
+    nccl_uct_ep_t           *uct_ep_am;
+    nccl_uct_comm_addr_t    addr; /* Remote addresses */
 
     nccl_uct_rdesc_t        *free_rdesc; /* Available rdesc for reuse */
     uint64_t                rdesc_id; 
@@ -234,7 +241,8 @@ static const uct_ep_addr_t *nccl_uct_ep_addr_ep(nccl_uct_ep_addr_t *addr)
 }
 
 static ncclResult_t nccl_uct_ep_addr_set(nccl_uct_ep_addr_t *addr,
-                                         const nccl_uct_comm_t *comm)
+                                         const nccl_uct_comm_t *comm,
+                                         const nccl_uct_ep_t *uct_ep)
 {
     nccl_uct_iface_t *uct_iface = comm->uct_iface;
     size_t total                = uct_iface->dev_addr_size +
@@ -250,7 +258,7 @@ static ncclResult_t nccl_uct_ep_addr_set(nccl_uct_ep_addr_t *addr,
     addr->ep_addr_size  = uct_iface->ep_addr_size;
 
     memcpy(addr->data, uct_iface->dev_addr, addr->dev_addr_size);
-    memcpy(addr->data + addr->dev_addr_size, comm->uct_ep->addr,
+    memcpy(addr->data + addr->dev_addr_size, uct_ep->addr,
            uct_iface->ep_addr_size);
     return ncclSuccess;
 }
@@ -940,6 +948,11 @@ static ncclResult_t nccl_uct_comm_init(nccl_uct_comm_t *comm,
         return ncclSystemError;
     }
 
+    comm->uct_ep_am = nccl_uct_ep_create(comm->uct_iface);
+    if (comm->uct_ep_am == NULL) {
+        return ncclSystemError;
+    }
+
     return ncclSuccess;
 }
 
@@ -964,7 +977,7 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
     nccl_uct_listen_handle_t *handle = listen_handle;
     nccl_uct_stage_t *stage          = &handle->stage;
     nccl_uct_comm_t *comm            = stage->comm;
-    nccl_uct_ep_addr_t addr;
+    nccl_uct_comm_addr_t addr;
     int ready;
 
     *send_comm = NULL;
@@ -986,7 +999,8 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
 
         NCCLCHECK(nccl_uct_comm_init(comm, &context, dev));
         stage->state = NCCL_UCT_RECEIVE_ADDR;
-        NCCLCHECK(nccl_uct_ep_addr_set(&addr, comm));
+        NCCLCHECK(nccl_uct_ep_addr_set(&addr.rma, comm, comm->uct_ep));
+        NCCLCHECK(nccl_uct_ep_addr_set(&addr.am, comm, comm->uct_ep_am));
         /* TODO: Add EP addresses for multiple QPs */
         NCCLCHECK(ncclSocketSend(&comm->sock, &addr, sizeof(addr)));
 
@@ -1002,7 +1016,8 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
             return ncclSuccess;
         }
 
-        NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep, &comm->addr));
+        NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep, &comm->addr.rma));
+        NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep_am, &comm->addr.am));
         WARN("connect rx'd");
         stage->state = NCCL_UCT_DONE;
         *send_comm = comm;
@@ -1023,8 +1038,7 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
     nccl_uct_listen_comm_t *l_comm = listen_comm;
     nccl_uct_stage_t *stage        = &l_comm->stage;
     nccl_uct_comm_t *comm          = stage->comm;
-    nccl_uct_ep_addr_t addr;
-    int ready;
+    nccl_uct_comm_addr_t addr; int ready;
 
     *recv_comm = NULL;
 
@@ -1056,8 +1070,14 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
             return ncclSystemError;
         }
 
+        comm->uct_ep_am  = nccl_uct_ep_create(comm->uct_iface);
+        if (comm->uct_ep_am == NULL) {
+            return ncclSystemError;
+        }
+
         stage->state = NCCL_UCT_RECEIVE_ADDR;
-        NCCLCHECK(nccl_uct_ep_addr_set(&addr, comm));
+        NCCLCHECK(nccl_uct_ep_addr_set(&addr.rma, comm, comm->uct_ep));
+        NCCLCHECK(nccl_uct_ep_addr_set(&addr.am, comm, comm->uct_ep_am));
         NCCLCHECK(ncclSocketSend(&comm->sock, &addr, sizeof(addr)));
 
         WARN("accepted for dev=%d w=%p i=%p ep=%p",
@@ -1072,7 +1092,8 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
             return ncclSuccess;
         }
 
-        NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep, &comm->addr));
+        NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep, &comm->addr.rma));
+        NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep_am, &comm->addr.am));
         WARN("accept rx'd");
         stage->state = NCCL_UCT_DONE;
         *recv_comm = comm;
@@ -1310,7 +1331,7 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
                                    void **request)
 {
     nccl_uct_comm_t *comm      = recv_comm;
-    nccl_uct_ep_t *uct_ep      = comm->uct_ep;
+    nccl_uct_ep_t *uct_ep      = comm->uct_ep_am;
     nccl_uct_memh_t **uct_memh = (nccl_uct_memh_t **)mhandles;
     size_t length              = nccl_uct_rdesc_size(n);
     nccl_uct_rdesc_t *rdesc;
@@ -1419,6 +1440,7 @@ static ncclResult_t nccl_uct_close(void *close_comm)
     WARN("Closing comm=%p", comm);
 
     nccl_uct_ep_destroy(comm->uct_ep);
+    nccl_uct_ep_destroy(comm->uct_ep_am);
     nccl_uct_iface_close(comm->uct_iface);
     nccl_uct_worker_put(comm->uct_worker);
     free(comm);

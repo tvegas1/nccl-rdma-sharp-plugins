@@ -75,7 +75,7 @@ typedef struct {
     int size;
     void *data;
     int done;
-    uint8_t rkey[16]; /* TODO: Support bigger sizes */
+    uct_rkey_t rkey; /* TODO: Support bigger sizes */
 } nccl_uct_chunk_t;
 
 struct nccl_uct_rdesc;
@@ -152,6 +152,7 @@ typedef struct {
 typedef struct {
     uct_mem_h memh;
     nccl_uct_comm_t *comm;
+    uct_rkey_bundle_t bundle;
     uint8_t rkey[];
 } nccl_uct_memh_t;
 
@@ -500,7 +501,7 @@ static void nccl_uct_recv_desc_set(nccl_uct_rdesc_t *rdesc,
         desc->chunk[i].size = sizes[i];
         desc->chunk[i].data = data[i];
         desc->chunk[i].done = 0;
-        memcpy(desc->chunk[i].rkey, uct_memh[i]->rkey, rkey_size);
+        desc->chunk[i].rkey = uct_memh[i]->bundle.rkey;
     }
 }
 
@@ -1092,6 +1093,7 @@ static ncclResult_t nccl_uct_reg_mr(void *reg_comm, void *data, size_t size,
                                     int type, void **mhandle)
 {
     nccl_uct_comm_t *comm = reg_comm;
+    uct_component_h comp  = comm->uct_iface->comp;
     uct_md_h md           = comm->uct_iface->md;
     intptr_t addr         = (intptr_t)data;
     size_t rkey_size      = comm->uct_iface->rkey_packed_size;
@@ -1121,6 +1123,14 @@ static ncclResult_t nccl_uct_reg_mr(void *reg_comm, void *data, size_t size,
         return ncclSystemError;
     }
 
+    /* Get remote key */
+    status = uct_rkey_unpack(comp, uct_memh->rkey,
+                             &uct_memh->bundle);
+    if (status != UCS_OK) {
+        WARN("Failed to unpack rkey: error %d", status);
+        return ncclInternalError;
+    }
+
     *mhandle = uct_memh;
     return ncclSuccess;
 }
@@ -1137,6 +1147,7 @@ static ncclResult_t nccl_uct_reg_mr_dmabuf(void *reg_comm, void *data,
 static ncclResult_t nccl_uct_dereg_mr(void *dereg_comm, void *mhandle)
 {
     nccl_uct_comm_t *comm     = dereg_comm;
+    uct_component_h comp      = comm->uct_iface->comp;
     nccl_uct_memh_t *uct_memh = mhandle;
     ucs_status_t status;
 
@@ -1148,6 +1159,11 @@ static ncclResult_t nccl_uct_dereg_mr(void *dereg_comm, void *mhandle)
         WARN("Failed to deregister memh %p on comm %p: error %d",
              uct_memh, comm, status);
         return ncclSystemError;
+    }
+
+    status = uct_rkey_release(comp, &uct_memh->bundle);
+    if (status != UCS_OK) {
+        WARN("Failed to release rkey bundle: error %d", status);
     }
 
     free(uct_memh);
@@ -1198,19 +1214,10 @@ static ncclResult_t nccl_uct_send(nccl_uct_comm_t *comm, void *data, int size,
                                   nccl_uct_rdesc_t *rdesc, int i,
                                   void **request)
 {
-    uct_component_h comp = comm->uct_iface->comp;
-    uct_rkey_bundle_t bundle;
-    ucs_status_t status, rkey_status;
+    ucs_status_t status;
     uct_iov_t iov;
 
     *request = NULL;
-
-    /* Get remote key */
-    status = uct_rkey_unpack(comp, rdesc->desc.chunk[i].rkey, &bundle);
-    if (status != UCS_OK) {
-        WARN("Failed to unpacked rkey: error %d", status);
-        return ncclInternalError;
-    }
 
     /* Details for local data */
     iov.buffer = data;
@@ -1223,12 +1230,8 @@ static ncclResult_t nccl_uct_send(nccl_uct_comm_t *comm, void *data, int size,
 
     status = uct_ep_put_zcopy(comm->uct_ep->ep, &iov, 1,
                               (uint64_t)rdesc->desc.chunk[i].data,
-                              bundle.rkey, &rdesc->completion);
-
-    rkey_status = uct_rkey_release(comp, &bundle);
-    if (rkey_status != UCS_OK) {
-        WARN("Failed to release rkey bundle: error %d", rkey_status);
-    }
+                              rdesc->desc.chunk[i].rkey,
+                              &rdesc->completion);
 
     if (status == UCS_OK) {
         rdesc->completion.count--;

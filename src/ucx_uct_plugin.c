@@ -270,7 +270,7 @@ static uct_iface_h nccl_uct_resource_iface_open(uct_worker_h worker,
     ucs_status_t status;
     uct_iface_config_t *config;
     uct_iface_h iface;
-    uct_iface_params_t params;
+    uct_iface_params_t params = {};
 
     status = uct_md_iface_config_read(md, tl->tl_name, NULL, NULL, &config);
     if (status != UCS_OK) {
@@ -293,7 +293,7 @@ static uct_iface_h nccl_uct_resource_iface_open(uct_worker_h worker,
     status = uct_iface_open(md, worker, &params, config, &iface);
     uct_config_release(config);
     if (status != UCS_OK) {
-        WARN("Failed to open iface %s/%s: error %d", tl->tl_name, tl->dev_name);
+        WARN("Failed to open iface %s/%s: error %d", tl->tl_name, tl->dev_name, status);
         return NULL;
     }
 
@@ -473,7 +473,6 @@ static size_t nccl_uct_rdesc_size(int n)
 static void nccl_uct_completion_callback(uct_completion_t *comp)
 {
     assert(comp->count == 0);
-    WARN("COMPLETION comp %p count %d", comp, comp->count);
 }
 
 static void nccl_uct_completion_init(uct_completion_t *completion, int count)
@@ -493,6 +492,7 @@ static void nccl_uct_recv_desc_set(nccl_uct_rdesc_t *rdesc,
     nccl_uct_rdesc_hdr_t *desc = &rdesc->desc;
     int i;
 
+    (void)rkey_size;
     assert(rkey_size <= sizeof(desc->chunk[0].rkey));
 
     desc->id         = id;
@@ -530,6 +530,7 @@ static ucs_status_t nccl_uct_atp_callback(void *arg, void *data, size_t length,
     nccl_uct_atp_t *atp   = data;
 
     WARN("ATP Rx'd rdesc=%p id=%d desc.id=%d", atp->rdesc, atp->id, atp->rdesc->desc.id);
+    (void)magic;
     assert(magic == NCCL_UCT_MAGIC);
     assert(atp->id == atp->rdesc->desc.id);
     assert(atp->count == atp->rdesc->desc.count);
@@ -556,6 +557,7 @@ static ucs_status_t nccl_uct_rtr_callback(void *arg, void *data, size_t length,
         return UCS_OK;
     }
 
+    (void)magic;
     assert(magic == NCCL_UCT_MAGIC);
     assert((size == length) && (size == nccl_uct_rdesc_size(desc->count)));
 
@@ -750,7 +752,6 @@ fail:
 
 static ncclResult_t nccl_uct_init(ncclDebugLogger_t logFunction)
 {
-    sleep (10);
     nccl_uct_context_init(&context);
     return nccl_p2p_ib_init(&context.dev_count, ncclIbDevs, context.if_name,
                             &context.if_addr, NULL, logFunction);
@@ -1209,7 +1210,6 @@ static ucs_status_t nccl_uct_send_atp(nccl_uct_comm_t *comm,
     int i;
 
     assert(rdesc->send_atp);
-    //assert(rdesc->completion.count == 1);
 
     atp.id    = rdesc->desc.id;
     atp.rdesc = rdesc->desc.peer_rdesc;
@@ -1219,10 +1219,11 @@ static ucs_status_t nccl_uct_send_atp(nccl_uct_comm_t *comm,
         atp.sizes[i] = rdesc->reqs[i].size;
     }
 
-    /* TODO: Add fence here */
+    status = uct_ep_fence(comm->uct_ep->ep, 0);
+    assert(status == UCS_OK);
+
     status = uct_ep_am_short(comm->uct_ep->ep, NCCL_UCT_AM_ATP,
                              NCCL_UCT_MAGIC, &atp, sizeof(atp));
-    assert(status != UCS_INPROGRESS);
     if (status == UCS_OK) {
         rdesc->completion.count--;
     }
@@ -1265,15 +1266,12 @@ static ncclResult_t nccl_uct_send(nccl_uct_comm_t *comm, void *data, int size,
     if (rdesc->desc.count == 1) {
         assert(rdesc->send_atp != 0);
 
-        /* TODO: Add fence */
         status = nccl_uct_send_atp(comm, rdesc);
         if (status == UCS_OK) {
             rdesc->send_atp = 0;
         }
     }
 
-    // add atp
-    //uct_worker_progress(comm->uct_worker->worker);
     nccl_uct_comm_rdesc_del(rdesc);
     rdesc->desc.chunk[i].done = 1;
     *request = nccl_uct_rdesc_get_req(rdesc, i, size); /* send request */
@@ -1293,7 +1291,6 @@ static ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
     int i;
     WARN("ISEND comm=%p %p/%zu tag %d", comm, data, size, tag);
 
-    //uct_worker_progress(comm->uct_worker->worker);
     stat_send++;
     *request = NULL;
 
@@ -1349,7 +1346,6 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
      * 4. Return as a request
      */
 
-    //uct_worker_progress(comm->uct_worker->worker);
     rdesc = nccl_uct_comm_rdesc_get(comm);
     if (rdesc == NULL) {
         WARN("Failed to get an rdesc");
@@ -1409,24 +1405,17 @@ conclude:
         assert(&rdesc->reqs[0] == req);
         if (sizes != NULL) {
             memcpy(sizes, rdesc->sizes, rdesc->desc.count * sizeof(*sizes));
-#if 0
-            for (int i = 0; i < rdesc->desc.count; i++) {
-                WARN("  size[%d]=%d", i, sizes[i]);
-            }
-#endif
         }
     } else {
         /* isend() request */
         if (sizes != NULL) {
             sizes[0] = req->size;
-            WARN("  send_size=%d", sizes[0]);
         }
     }
 
     if (--rdesc->nccl_usage < 1) {
         assert(rdesc->nccl_usage == 0);
         nccl_uct_comm_rdesc_put(rdesc);
-        WARN("TEST done %p rdesc=%p", request, rdesc);
     }
 
     return ncclSuccess;
@@ -1436,7 +1425,6 @@ static ncclResult_t nccl_uct_close(void *close_comm)
 {
     nccl_uct_comm_t *comm = close_comm;
 
-//    printf("stat send %zu iter %zu\n", stat_send, stat_iter);
     WARN("Closing comm=%p", comm);
 
     nccl_uct_ep_destroy(comm->uct_ep);

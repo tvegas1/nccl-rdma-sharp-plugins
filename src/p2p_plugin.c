@@ -224,8 +224,7 @@ ncclResult_t nccl_p2p_ib_get_properties(ncclIbDev *devs, int dev, ncclNetPropert
   props->port = ibDev->portNum + ibDev->realPort;
   props->maxComms = ibDev->maxQp;
 
-  if (p2p_plugin == NCCL_P2P_IB || p2p_plugin == NCCL_P2P_UCX ||
-      p2p_plugin == NCCL_P2P_UCX_UCT) {
+  if (p2p_plugin == NCCL_P2P_IB || p2p_plugin == NCCL_P2P_UCX) {
     props->maxRecvs = NCCL_NET_IB_MAX_RECVS;
   } else {
     props->maxRecvs = 1;

@@ -1087,7 +1087,8 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
             return ncclSystemError;
         }
 
-        if (nccl_p2p_gdr_support(comm->dev) == ncclSuccess) {
+        if ((nccl_p2p_gdr_support(comm->dev) == ncclSuccess) ||
+            (nccl_p2p_dmabuf_support(comm->dev) == ncclSuccess)) {
             comm->gpu_flush.enabled = 1;
             comm->gpu_flush.uct_ep  = nccl_uct_ep_create(comm->uct_iface);
             if (comm->gpu_flush.uct_ep == NULL) {
@@ -1398,14 +1399,15 @@ static void nccl_uct_get_unpack(void *arg, const void *data, size_t length)
 static ncclResult_t nccl_uct_iflush(void *recv_comm, int n, void **data,
                                     int *sizes, void **mhandle, void **request)
 {
+    int last                   = -1;
     nccl_uct_comm_t *comm      = recv_comm;
     nccl_uct_memh_t **uct_memh = (nccl_uct_memh_t **)mhandle;
     nccl_uct_rdesc_t *rdesc;
     ucs_status_t status;
-    int i, last;
+    int i;
 
     if (comm->gpu_flush.enabled) {
-        for (i = 0, last = -1; i < n; i++) {
+        for (i = 0; i < n; i++) {
             if (sizes[i]) {
                 last = i;
             }
@@ -1433,6 +1435,9 @@ static ncclResult_t nccl_uct_iflush(void *recv_comm, int n, void **data,
                               &rdesc->completion);
     /* TODO: Handle failure to submit, or make QPs big enough anyways */
     assert((status == UCS_OK) || (status == UCS_INPROGRESS));
+    if ((status != UCS_OK) && (status != UCS_INPROGRESS)) {
+        return ncclInternalError;
+    }
 
     *request = nccl_uct_rdesc_get_req(rdesc, 0, -2); /* flush request */
     return ncclSuccess;

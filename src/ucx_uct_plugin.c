@@ -18,6 +18,7 @@ typedef enum {
     NCCL_UCT_START = 0,
     NCCL_UCT_CONNECT,
     NCCL_UCT_ACCEPT,
+    NCCL_UCT_RECEIVE_COMM,
     NCCL_UCT_RECEIVE_ADDR,
     NCCL_UCT_DONE
 } nccl_uct_state_t;
@@ -58,6 +59,7 @@ typedef struct nccl_uct_worker {
     int                     count;   /* Usage count */
     ucs_async_context_t     *async;
     uct_worker_h            worker;
+    nccl_uct_iface_t        *uct_iface;
     struct nccl_uct_context *context;
 } nccl_uct_worker_t;
 
@@ -116,6 +118,7 @@ typedef struct nccl_uct_rdesc {
     struct nccl_uct_rdesc *prev; /* comm's linked list */
     struct nccl_uct_rdesc *next;
 
+    double                start;
     struct nccl_uct_comm  *comm;
     nccl_uct_rdesc_hdr_t  desc;
     nccl_uct_chunk_t      storage[NCCL_UCX_UCT_MAX_RECVS]; /* Don't use */
@@ -144,11 +147,16 @@ typedef struct nccl_uct_comm {
     nccl_uct_rdesc_t        *free_rdesc; /* Available rdesc for reuse */
     uint64_t                rdesc_id;
 
+    struct nccl_uct_comm    *remote_comm;
+
     struct {
-        nccl_uct_ep_t       *uct_ep; /* Locally read from HCA */
+        nccl_uct_ep_t       *uct_ep;    /* Locally read from HCA */
+        nccl_uct_ep_t       *uct_ep_rx; /* Locally read from HCA */
         int                 enabled;
         nccl_uct_ep_addr_t  addr;
-        uint32_t            local_mem;
+
+        uint8_t mem[512];
+        uct_mem_h           memh;
     } gpu_flush;
 
     /* Pending rdesc, either rx/tx */
@@ -181,6 +189,7 @@ typedef struct {
         union ncclSocketAddress addr;
         uint32_t                id;
     } listener;
+    nccl_uct_comm_t             *comm;
     nccl_uct_stage_t            stage;
 } nccl_uct_listen_handle_t;
 
@@ -193,6 +202,7 @@ typedef struct {
     nccl_uct_worker_t       *uct_worker;
     struct nccl_uct_context *context;
 
+    nccl_uct_comm_t         *comm;
     nccl_uct_stage_t  stage;
 } nccl_uct_listen_comm_t;
 
@@ -216,7 +226,6 @@ typedef struct nccl_uct_context {
 
 #define NCCL_UCT_LISTEN_HANDLE_MAGIC 0x43cf19ed91abdb85
 
-#define NCCL_UCT_MAGIC 0x59ab18e432ad73da
 #define NCCL_UCT_TAG_SHIFT 0x100
 
 static pthread_mutex_t nccl_uct_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -291,13 +300,13 @@ static uct_iface_h nccl_uct_resource_iface_open(uct_worker_h worker,
     params.field_mask           = UCT_IFACE_PARAM_FIELD_OPEN_MODE   |
                                   UCT_IFACE_PARAM_FIELD_DEVICE      |
                                   UCT_IFACE_PARAM_FIELD_STATS_ROOT  |
-                                  UCT_IFACE_PARAM_FIELD_RX_HEADROOM |
-                                  UCT_IFACE_PARAM_FIELD_CPU_MASK;
+                                  UCT_IFACE_PARAM_FIELD_RX_HEADROOM ;
     params.open_mode            = UCT_IFACE_OPEN_MODE_DEVICE;
     params.mode.device.tl_name  = tl->tl_name;
     params.mode.device.dev_name = tl->dev_name;
     params.stats_root           = NULL;
     params.rx_headroom          = sizeof(nccl_uct_rx_desc_t);
+    params.features             = UCT_IFACE_FEATURE_FLUSH_REMOTE;
 
     status = uct_iface_open(md, worker, &params, config, &iface);
     uct_config_release(config);
@@ -386,7 +395,8 @@ static nccl_uct_ep_t *nccl_uct_ep_create(nccl_uct_iface_t *uct_iface)
         return NULL;
     }
 
-    uct_ep->addr = (uct_ep_addr_t *)uct_ep->data;
+    uct_ep->addr      = (uct_ep_addr_t *)uct_ep->data;
+    uct_ep->uct_iface = uct_iface;
 
     ep_params.field_mask = UCT_EP_PARAM_FIELD_IFACE;
     ep_params.iface      = uct_iface->iface;
@@ -540,7 +550,6 @@ static ucs_status_t nccl_uct_atp_callback(void *arg, void *data, size_t length,
 
     WARN("ATP Rx'd rdesc=%p id=%d desc.id=%d", atp->rdesc, atp->id, atp->rdesc->desc.id);
     (void)magic;
-    assert(magic == NCCL_UCT_MAGIC);
     assert(atp->id == atp->rdesc->desc.id);
     assert(atp->count == atp->rdesc->desc.count);
 
@@ -556,10 +565,13 @@ static ucs_status_t nccl_uct_rtr_callback(void *arg, void *data, size_t length,
                                           unsigned flags)
 {
     nccl_uct_comm_t *comm      = arg;
-    nccl_uct_rdesc_t *rdesc    = nccl_uct_comm_rdesc_get(comm);
     uint64_t magic             = nccl_uct_am_take_magic(&data, &length);
     nccl_uct_rdesc_hdr_t *desc = data;
     size_t size                = desc->size;
+    nccl_uct_rdesc_t *rdesc;
+
+    comm = (void *)magic;
+    rdesc = nccl_uct_comm_rdesc_get(comm);
 
     if (rdesc == NULL) {
         WARN("Failed to get an rdesc in RTR callback");
@@ -567,7 +579,6 @@ static ucs_status_t nccl_uct_rtr_callback(void *arg, void *data, size_t length,
     }
 
     (void)magic;
-    assert(magic == NCCL_UCT_MAGIC);
     assert((size == length) && (size == nccl_uct_rdesc_size(desc->count)));
 
     memcpy(&rdesc->desc, desc, size);
@@ -776,6 +787,14 @@ static ncclResult_t nccl_uct_get_properties(int dev, ncclNetProperties_t* props)
     return nccl_p2p_ib_get_properties(ncclIbDevs, dev, props);
 }
 
+static const char *nccl_dev_name(int dev)
+{
+    static __thread char buf[64];
+    snprintf(buf, sizeof(buf), "%s:%d", ncclIbDevs[dev].devName,
+             ncclIbDevs[dev].portNum);
+    return buf;
+}
+
 static ncclResult_t nccl_uct_worker_create(nccl_uct_worker_t *w,
                                            nccl_uct_context_t *context,
                                            int dev)
@@ -803,18 +822,19 @@ static ncclResult_t nccl_uct_worker_create(nccl_uct_worker_t *w,
     w->id.thread  = pthread_self();
     w->context = context;
 
+    w->uct_iface = nccl_uct_iface_open(w, context->tl_name,
+                                       nccl_dev_name(dev));
+    if (w->uct_iface == NULL) {
+        printf("FAILED!!!\n");
+        WARN("Failed to create UCT iface for worker: dev=%d", dev);
+        goto fail;
+    }
+    NCCLCHECK(nccl_uct_iface_set_rtr_mode(w->uct_iface, NULL));
+
     return ncclSuccess;
 
 fail:
     return ncclSystemError;
-}
-
-static const char *nccl_dev_name(int dev)
-{
-    static __thread char buf[64];
-    snprintf(buf, sizeof(buf), "%s:%d", ncclIbDevs[dev].devName,
-             ncclIbDevs[dev].portNum);
-    return buf;
 }
 
 static nccl_uct_worker_t *nccl_uct_worker_get(nccl_uct_context_t *context,
@@ -826,7 +846,8 @@ static nccl_uct_worker_t *nccl_uct_worker_get(nccl_uct_context_t *context,
 
 #if 1
     for (w = context->worker_list; w != NULL; w = w->next) {
-        if ((w->id.dev == dev) && (w->id.thread == pthread_self())) {
+        goto out;
+        if ((w->id.dev == dev)) {// && (w->id.thread == pthread_self())) {
             goto out;
         }
     }
@@ -856,6 +877,7 @@ out:
 
 static void nccl_uct_worker_destroy(nccl_uct_worker_t *w)
 {
+    nccl_uct_iface_close(w->uct_iface);
     uct_worker_destroy(w->worker);
     ucs_async_context_destroy(w->async);
     free(w);
@@ -885,6 +907,7 @@ static ncclResult_t nccl_uct_listen(int dev, void *listen_handle,
 {
     nccl_uct_listen_handle_t *handle = listen_handle;
     nccl_uct_listen_comm_t   *comm   = calloc(1, sizeof(*comm));
+    nccl_uct_comm_t *accept_comm;
     union ncclSocketAddress addr;
 
     if (comm == NULL) {
@@ -908,6 +931,9 @@ static ncclResult_t nccl_uct_listen(int dev, void *listen_handle,
         return ncclSystemError;
     }
 
+    NCCLCHECK(ncclIbMalloc((void **)&accept_comm, sizeof(*accept_comm)));
+
+    comm->comm       = accept_comm;
     comm->context    = &context;
     comm->dev        = dev;
     comm->id         = context.listener_id++;
@@ -919,6 +945,7 @@ static ncclResult_t nccl_uct_listen(int dev, void *listen_handle,
     handle->magic         = NCCL_UCT_LISTEN_HANDLE_MAGIC;
     handle->listener.id   = comm->id;
     handle->listener.addr = addr;
+    handle->comm          = comm->comm;
 
     WARN("Listen dev=%d ok", dev);
     return ncclSuccess;
@@ -946,13 +973,8 @@ static ncclResult_t nccl_uct_comm_init(nccl_uct_comm_t *comm,
         return ncclSystemError;
     }
 
-    comm->uct_iface = nccl_uct_iface_open(comm->uct_worker, context->tl_name,
-                            nccl_dev_name(dev));
-    if (comm->uct_iface == NULL) {
-        return ncclSystemError;
-    }
+    comm->uct_iface = comm->uct_worker->uct_iface;
 
-    NCCLCHECK(nccl_uct_iface_set_rtr_mode(comm->uct_iface, comm));
 
     comm->uct_ep = nccl_uct_ep_create(comm->uct_iface);
     if (comm->uct_ep == NULL) {
@@ -999,6 +1021,9 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
         NCCLCHECK(ncclSocketInit(&comm->sock, &handle->listener.addr,
                                  handle->magic, ncclSocketTypeNetIb, NULL, 1));
         NCCLCHECK(ncclSocketConnect(&comm->sock));
+
+        comm->remote_comm = handle->comm;
+
         stage->comm  = comm;
         stage->state = NCCL_UCT_CONNECT;
         /* fallthrough */
@@ -1014,6 +1039,7 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
         NCCLCHECK(nccl_uct_ep_addr_set(&addr.am, comm, comm->uct_ep_am));
         /* TODO: Add EP addresses for multiple QPs */
         NCCLCHECK(ncclSocketSend(&comm->sock, &addr, sizeof(addr)));
+        NCCLCHECK(ncclSocketSend(&comm->sock, &comm, sizeof(comm)));
 
         WARN("connect for dev=%d w=%p i=%p ep=%p",
              dev, comm->uct_worker, comm->uct_iface, comm->uct_ep);
@@ -1028,7 +1054,7 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
         }
 
         NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep, &comm->addr.rma));
-        NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep_am, &comm->addr.am));
+        //NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep_am, &comm->addr.am));
         WARN("connect rx'd");
         stage->state = NCCL_UCT_DONE;
         *send_comm = comm;
@@ -1050,17 +1076,18 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
     nccl_uct_stage_t *stage        = &l_comm->stage;
     nccl_uct_comm_t *comm          = stage->comm;
     nccl_uct_comm_addr_t addr; int ready;
+    ucs_status_t status;
 
     *recv_comm = NULL;
 
     switch (stage->state) {
     case NCCL_UCT_START:
-        NCCLCHECK(ncclIbMalloc((void **)&comm, sizeof(*comm)));
-        stage->comm  = comm;
+        stage->comm  = l_comm->comm;
+        comm = stage->comm;
         stage->state = NCCL_UCT_ACCEPT;
         NCCLCHECK(ncclSocketInit(&comm->sock, NULL, NCCL_SOCKET_MAGIC,
                                  ncclSocketTypeUnknown, NULL, 0));
-        NCCLCHECK(ncclSocketAccept(&comm->sock, &l_comm->sock));
+        NCCLCHECK(ncclSocketAccept(&stage->comm->sock, &l_comm->sock));
         /* fallthrough */
     case NCCL_UCT_ACCEPT:
         NCCLCHECK(ncclSocketReady(&comm->sock, &ready));
@@ -1069,47 +1096,60 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
         comm->dev        = l_comm->dev;
         comm->context    = l_comm->context;
         comm->uct_worker = l_comm->uct_worker;
-        comm->uct_iface  = nccl_uct_iface_open(comm->uct_worker,
-                                               comm->context->tl_name,
-                                               nccl_dev_name(l_comm->dev));
-        if (comm->uct_iface == NULL) {
-            return ncclSystemError;
-        }
-        NCCLCHECK(nccl_uct_iface_set_rtr_mode(comm->uct_iface, comm));
+        comm->uct_iface  = comm->uct_worker->uct_iface;
 
         comm->uct_ep     = nccl_uct_ep_create(comm->uct_iface);
         if (comm->uct_ep == NULL) {
             return ncclSystemError;
         }
 
+#if 0
         comm->uct_ep_am  = nccl_uct_ep_create(comm->uct_iface);
         if (comm->uct_ep_am == NULL) {
             return ncclSystemError;
         }
+#endif
 
         if ((nccl_p2p_gdr_support(comm->dev) == ncclSuccess) ||
             (nccl_p2p_dmabuf_support(comm->dev) == ncclSuccess)) {
             comm->gpu_flush.enabled = 1;
+            comm->gpu_flush.uct_ep_rx  = nccl_uct_ep_create(comm->uct_iface);
+            if (comm->gpu_flush.uct_ep_rx == NULL) {
+                return ncclSystemError;
+            }
             comm->gpu_flush.uct_ep  = nccl_uct_ep_create(comm->uct_iface);
             if (comm->gpu_flush.uct_ep == NULL) {
                 return ncclSystemError;
             }
             NCCLCHECK(nccl_uct_ep_addr_set(&comm->gpu_flush.addr, comm,
-                                           comm->gpu_flush.uct_ep));
+                                           comm->gpu_flush.uct_ep_rx));
             NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->gpu_flush.uct_ep,
                                                 &comm->gpu_flush.addr));
+            NCCLCHECK(nccl_uct_ep_addr_set(&comm->gpu_flush.addr, comm,
+                                           comm->gpu_flush.uct_ep));
+            NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->gpu_flush.uct_ep_rx,
+                                                &comm->gpu_flush.addr));
+
+            status = uct_md_mem_reg(comm->uct_iface->md,
+                                    (void *)comm->gpu_flush.mem, sizeof(comm->gpu_flush.mem),
+                                    UCT_MD_MEM_ACCESS_ALL,
+                                    &comm->gpu_flush.memh);
+            if (status != UCS_OK) {
+                return ncclSystemError;
+            }
         }
 
-        stage->state = NCCL_UCT_RECEIVE_ADDR;
         NCCLCHECK(nccl_uct_ep_addr_set(&addr.rma, comm, comm->uct_ep));
-        NCCLCHECK(nccl_uct_ep_addr_set(&addr.am, comm, comm->uct_ep_am));
+        //NCCLCHECK(nccl_uct_ep_addr_set(&addr.am, comm, comm->uct_ep_am));
         NCCLCHECK(ncclSocketSend(&comm->sock, &addr, sizeof(addr)));
 
         WARN("accepted for dev=%d w=%p i=%p ep=%p",
              l_comm->dev, comm->uct_worker, comm->uct_iface, comm->uct_ep);
 
+        stage->state = NCCL_UCT_RECEIVE_ADDR;
         /* fallthrough */
     case NCCL_UCT_RECEIVE_ADDR:
+        stage->offset = 0;
         NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->sock,
                                      &comm->addr, sizeof(comm->addr),
                                      &stage->offset));
@@ -1118,10 +1158,21 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
         }
 
         NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep, &comm->addr.rma));
-        NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep_am, &comm->addr.am));
-        WARN("accept rx'd");
-        stage->state = NCCL_UCT_DONE;
+        //NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep_am, &comm->addr.am));
+
+        stage->state = NCCL_UCT_RECEIVE_COMM;
+        /* fallthrough */
+    case NCCL_UCT_RECEIVE_COMM:
+        stage->offset = 0;
+        NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->sock,
+                                     &comm->remote_comm, sizeof(comm->remote_comm),
+                                     &stage->offset));
+        if (stage->offset != sizeof(comm->remote_comm)) {
+            return ncclSuccess;
+        }
         *recv_comm = comm;
+        stage->state = NCCL_UCT_DONE;
+        WARN("accept rx'd");
         break;
 
     default:
@@ -1244,11 +1295,11 @@ static ucs_status_t nccl_uct_send_atp(nccl_uct_comm_t *comm,
         atp.sizes[i] = rdesc->reqs[i].size;
     }
 
-    status = uct_ep_fence(comm->uct_ep->ep, 0);
-    assert(status == UCS_OK);
+    //status = uct_ep_fence(comm->uct_ep->ep, 0);
+    //assert(status == UCS_OK);
 
     status = uct_ep_am_short(comm->uct_ep->ep, NCCL_UCT_AM_ATP,
-                             NCCL_UCT_MAGIC, &atp, sizeof(atp));
+                             (uint64_t)comm->remote_comm, &atp, sizeof(atp));
     if (status == UCS_OK) {
         rdesc->completion.count--;
     }
@@ -1256,6 +1307,8 @@ static ucs_status_t nccl_uct_send_atp(nccl_uct_comm_t *comm,
     return status;
 }
 
+static int send_count;
+static int send_iter;
 static ncclResult_t nccl_uct_send(nccl_uct_comm_t *comm, void *data, int size,
                                   nccl_uct_memh_t *uct_memh,
                                   nccl_uct_rdesc_t *rdesc, int i,
@@ -1282,9 +1335,7 @@ static ncclResult_t nccl_uct_send(nccl_uct_comm_t *comm, void *data, int size,
 
     if (status == UCS_OK) {
         rdesc->completion.count--;
-        printf("kay\n");
     } else if (status != UCS_INPROGRESS) {
-        WARN("Failed to PUT: error %d", status);
         return ncclSuccess;
     }
 
@@ -1300,6 +1351,7 @@ static ncclResult_t nccl_uct_send(nccl_uct_comm_t *comm, void *data, int size,
     nccl_uct_comm_rdesc_del(rdesc);
     rdesc->desc.chunk[i].done = 1;
     *request = nccl_uct_rdesc_get_req(rdesc, i, size); /* send request */
+    send_count ++;
     return ncclSuccess;
 }
 
@@ -1311,13 +1363,14 @@ static ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
     nccl_uct_rdesc_t *rdesc;
     ncclResult_t result = ncclSuccess;
     int i;
-    WARN("ISEND comm=%p %p/%zu tag %d", comm, data, size, tag);
+//    WARN("ISEND comm=%p %p/%zu tag %d", comm, data, size, tag);
 
     *request = NULL;
 
     for (rdesc = comm->rdesc_list.head; rdesc != NULL; rdesc = rdesc->next) {
         WARN(" Try rdesc=%p count=%d", rdesc, rdesc->desc.count);
         for (i = 0; i < rdesc->desc.count; i++) {
+            send_iter++;
             if (!rdesc->desc.chunk[i].done &&
                 (rdesc->desc.chunk[i].tag == tag)) {
                 goto found;
@@ -1332,10 +1385,10 @@ static ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
 found:
 
     result = nccl_uct_send(comm, data, size, uct_memh, rdesc, i, request);
-    WARN("VEG isend: rdesc tag 0x%x size=%d matched peer_rdesc=%p request=%p",
-         tag, size, rdesc->desc.peer_rdesc, *request);
+//    WARN("VEG isend: rdesc tag 0x%x size=%d matched peer_rdesc=%p request=%p",
+ //        tag, size, rdesc->desc.peer_rdesc, *request);
 out:
-    while (uct_worker_progress(comm->uct_worker->worker));
+    uct_worker_progress(comm->uct_worker->worker);
     return result;
 }
 
@@ -1348,7 +1401,7 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
                                    void **request)
 {
     nccl_uct_comm_t *comm      = recv_comm;
-    nccl_uct_ep_t *uct_ep      = comm->uct_ep_am;
+    nccl_uct_ep_t *uct_ep      = comm->uct_ep;
     nccl_uct_memh_t **uct_memh = (nccl_uct_memh_t **)mhandles;
     size_t length              = nccl_uct_rdesc_size(n);
     nccl_uct_rdesc_t *rdesc;
@@ -1368,14 +1421,13 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
 
     rdesc = nccl_uct_comm_rdesc_get(comm);
     if (rdesc == NULL) {
-        WARN("Failed to get an rdesc");
         return ncclInternalError;
     }
 
     id = comm->rdesc_id++;
     nccl_uct_recv_desc_set(rdesc, id, n, data, sizes, tags, uct_memh);
 
-    status = uct_ep_am_short(uct_ep->ep, NCCL_UCT_AM_RTR, NCCL_UCT_MAGIC,
+    status = uct_ep_am_short(uct_ep->ep, NCCL_UCT_AM_RTR, (uint64_t)comm->remote_comm,
                              &rdesc->desc, length);
     if (status != UCS_OK) {
         nccl_uct_comm_rdesc_del(rdesc);
@@ -1384,16 +1436,28 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
     } else {
         nccl_uct_comm_rdesc_del(rdesc);
         *request = nccl_uct_rdesc_get_req(rdesc, 0, -1); /* receive request */
-        WARN("VEG irecv: rdesc=%p id=%d n=%d tag[0]=%d sizes[0]=%d",
-             rdesc, rdesc->desc.id, n, tags[0], sizes[0]);
+        //WARN("VEG irecv: rdesc=%p id=%d n=%d tag[0]=%d sizes[0]=%d",
+         //    rdesc, rdesc->desc.id, n, tags[0], sizes[0]);
     }
 
-    while (uct_worker_progress(comm->uct_worker->worker));
     return ncclSuccess;
 }
 
-static void nccl_uct_get_unpack(void *arg, const void *data, size_t length)
+static uint64_t iflush_count = 0;
+
+#include <sys/time.h>
+#include <time.h>
+#include <stdio.h>
+
+static double total_flush = 0;
+static int flush_start = 0;
+static int flush_end = 0;
+
+static double gettime(void)
 {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (double)tv.tv_sec * 1000 * 1000 + (double)tv.tv_usec;
 }
 
 static ncclResult_t nccl_uct_iflush(void *recv_comm, int n, void **data,
@@ -1404,6 +1468,7 @@ static ncclResult_t nccl_uct_iflush(void *recv_comm, int n, void **data,
     nccl_uct_memh_t **uct_memh = (nccl_uct_memh_t **)mhandle;
     nccl_uct_rdesc_t *rdesc;
     ucs_status_t status;
+    uct_iov_t iov;
     int i;
 
     if (comm->gpu_flush.enabled) {
@@ -1415,7 +1480,6 @@ static ncclResult_t nccl_uct_iflush(void *recv_comm, int n, void **data,
     }
 
     if (last == -1) {
-        *request = NULL;
         return ncclSuccess;
     }
 
@@ -1423,23 +1487,34 @@ static ncclResult_t nccl_uct_iflush(void *recv_comm, int n, void **data,
     if (rdesc == NULL) {
         return ncclInternalError;
     }
+    flush_start++;
+    rdesc->start = gettime();
 
     nccl_uct_comm_rdesc_del(rdesc);
     nccl_uct_recv_desc_set(rdesc, ~0, 0, NULL, NULL, NULL, &uct_memh[last]); /* TODO: cleanup */
 
-    status = uct_ep_get_bcopy(comm->gpu_flush.uct_ep->ep,
-                              nccl_uct_get_unpack,
-                              NULL, 1,
-                              (uint64_t)data[last],
-                              uct_memh[last]->bundle.rkey,
+    iov.buffer  = comm->gpu_flush.mem;
+    iov.length  = 65;
+    iov.memh    = comm->gpu_flush.memh;
+    iov.stride  = iov.length;
+    iov.count   = 1;
+
+    iflush_count++;
+    status = uct_ep_get_zcopy(comm->gpu_flush.uct_ep->ep,
+                              &iov, 1, 
+                              (uint64_t)data[last], uct_memh[last]->bundle.rkey,
                               &rdesc->completion);
     /* TODO: Handle failure to submit, or make QPs big enough anyways */
-    assert((status == UCS_OK) || (status == UCS_INPROGRESS));
-    if ((status != UCS_OK) && (status != UCS_INPROGRESS)) {
+    if (status == UCS_OK) {
+        *request = NULL;
+        nccl_uct_comm_rdesc_put(rdesc);
+    } else if (status == UCS_INPROGRESS) {
+        *request = nccl_uct_rdesc_get_req(rdesc, 0, -2); /* flush request */
+    } else {
         return ncclInternalError;
     }
 
-    *request = nccl_uct_rdesc_get_req(rdesc, 0, -2); /* flush request */
+
     return ncclSuccess;
 }
 
@@ -1449,13 +1524,14 @@ static ncclResult_t nccl_uct_test(void *request, int *done, int *sizes)
     nccl_uct_rdesc_t *rdesc = req->rdesc;
     nccl_uct_comm_t *comm   = rdesc->comm;
 
-    WARN("TEST %p", request);
+//    WARN("TEST %p", request);
+
+    //printf("TTEST comm->uct_worker %p tid %lld\n", comm->uct_worker, (long long ) pthread_self());
+    while (uct_worker_progress(comm->uct_worker->worker));
 
     if (rdesc->completion.count == 0) {
         goto conclude;
     }
-
-    while (uct_worker_progress(comm->uct_worker->worker));
 
     if (rdesc->send_atp && rdesc->completion.count == 1) {
         nccl_uct_send_atp(comm, rdesc);
@@ -1479,6 +1555,8 @@ conclude:
         }
     } else if (req->size == -2) {
         /* iflush request */
+          flush_end++;
+          total_flush += gettime() - rdesc->start;
     } else {
         /* isend() request */
         if (sizes != NULL) {
@@ -1498,14 +1576,21 @@ static ncclResult_t nccl_uct_close(void *close_comm)
 {
     nccl_uct_comm_t *comm = close_comm;
 
-    WARN("Closing comm=%p", comm);
+#if 0
+    printf(" pid %d UCT closing flush count=%zu total_flush=%lf count=%d/%d duration=%lf"
+           "send_count=%d send_iter=%d\n",
+       (int)getpid(), iflush_count, total_flush, flush_start, flush_end, total_flush / flush_start,
+       send_count, send_iter);
+#endif
 
     nccl_uct_ep_destroy(comm->uct_ep);
-    nccl_uct_ep_destroy(comm->uct_ep_am);
+    //nccl_uct_ep_destroy(comm->uct_ep_am);
     if (comm->gpu_flush.uct_ep != NULL) {
         nccl_uct_ep_destroy(comm->gpu_flush.uct_ep);
+        nccl_uct_ep_destroy(comm->gpu_flush.uct_ep_rx);
+        (void)uct_md_mem_dereg(comm->uct_iface->md,
+                               comm->gpu_flush.memh);
     }
-    nccl_uct_iface_close(comm->uct_iface);
     nccl_uct_worker_put(comm->uct_worker);
     free(comm);
 

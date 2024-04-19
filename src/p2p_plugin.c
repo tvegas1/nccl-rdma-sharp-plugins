@@ -214,8 +214,9 @@ ncclResult_t nccl_p2p_ib_get_properties(ncclIbDev *devs, int dev, ncclNetPropert
     props->ptrSupport |= NCCL_PTR_CUDA; // GDR support via nv_peermem
     INFO(NCCL_NET,"NET/IB : GPU Direct RDMA (nvidia-peermem) enabled for HCA %d '%s", dev, devs[dev].devName);
   }
+    props->ptrSupport |= NCCL_PTR_CUDA; // GDR support via nv_peermem
   props->regIsGlobal = 1;
-  if (p2p_plugin == NCCL_P2P_IB && nccl_p2p_dmabuf_support(dev) == ncclSuccess) {
+  if (((p2p_plugin == NCCL_P2P_UCX_UCT) || (p2p_plugin == NCCL_P2P_IB)) && nccl_p2p_dmabuf_support(dev) == ncclSuccess) {
     props->ptrSupport |= NCCL_PTR_DMABUF; // GDR support via DMA-BUF
     INFO(NCCL_NET,"NET/IB : GPU Direct RDMA (DMABUF) enabled for HCA %d '%s", dev, devs[dev].devName);
   }
@@ -225,7 +226,7 @@ ncclResult_t nccl_p2p_ib_get_properties(ncclIbDev *devs, int dev, ncclNetPropert
   props->maxComms = ibDev->maxQp;
 
   if (p2p_plugin == NCCL_P2P_IB || p2p_plugin == NCCL_P2P_UCX) {
-    props->maxRecvs = NCCL_NET_IB_MAX_RECVS;
+    props->maxRecvs = 1;
   } else {
     props->maxRecvs = 1;
   }
@@ -235,6 +236,7 @@ ncclResult_t nccl_p2p_ib_get_properties(ncclIbDev *devs, int dev, ncclNetPropert
   return ncclSuccess;
 }
 
+#if 0
 static void* ncclIbAsyncThreadMain(void* args) {
   struct ncclIbDev* dev = (struct ncclIbDev*)args;
   while (1) {
@@ -248,6 +250,7 @@ static void* ncclIbAsyncThreadMain(void* args) {
   }
   return NULL;
 }
+#endif
 
 int devSharpCompare(const void *a, const void *b)
 {
@@ -367,11 +370,13 @@ ncclResult_t nccl_p2p_ib_init(int *num_devs, ncclIbDev *ncclIbDevs, char *ncclIb
           }
           TRACE(NCCL_NET,"NET/IB: [%d] %s:%s:%d/%s speed=%d context=%p pciPath=%s ar=%d", d, devices[d]->name, devices[d]->dev_name, ncclIbDevs[ncclNIbDevs].portNum,
             portAttr.link_layer == IBV_LINK_LAYER_INFINIBAND ? "IB" : "RoCE", ncclIbDevs[ncclNIbDevs].speed, context, ncclIbDevs[ncclNIbDevs].pciPath, ncclIbDevs[ncclNIbDevs].ar);
+#if 0
           if (ncclIbAsyncThread != NULL) {
             pthread_create(ncclIbAsyncThread, NULL, ncclIbAsyncThreadMain, ncclIbDevs + ncclNIbDevs);
             ncclSetThreadName(*ncclIbAsyncThread, "NCCL IbAsync %2d", ncclNIbDevs);
             pthread_detach(*ncclIbAsyncThread); // will not be pthread_join()'d
           }
+#endif
 
           int mergedDev = ncclNMergedIbDevs;
           if (ncclParamIbMergeNics()) {

@@ -548,7 +548,7 @@ static ucs_status_t nccl_uct_atp_callback(void *arg, void *data, size_t length,
     uint64_t magic        = nccl_uct_am_take_magic(&data, &length);
     nccl_uct_atp_t *atp   = data;
 
-    WARN("ATP Rx'd rdesc=%p id=%d desc.id=%d", atp->rdesc, atp->id, atp->rdesc->desc.id);
+    //WARN("ATP Rx'd rdesc=%p id=%d desc.id=%d", atp->rdesc, atp->id, atp->rdesc->desc.id);
     (void)magic;
     assert(atp->id == atp->rdesc->desc.id);
     assert(atp->count == atp->rdesc->desc.count);
@@ -586,7 +586,7 @@ static ucs_status_t nccl_uct_rtr_callback(void *arg, void *data, size_t length,
     rdesc->send_atp   = 1;
     nccl_uct_completion_init(&rdesc->completion, desc->count + 1);
 
-    WARN("RX RTR: comm=%p rem_rdesc=%p id=%lu n=%u tag[0]=0x%x", comm, desc->peer_rdesc, desc->id, desc->count, rdesc->desc.chunk[0].tag);
+    //WARN("RX RTR: comm=%p rem_rdesc=%p id=%lu n=%u tag[0]=0x%x", comm, desc->peer_rdesc, desc->id, desc->count, rdesc->desc.chunk[0].tag);
 
     return UCS_OK;
 }
@@ -981,10 +981,12 @@ static ncclResult_t nccl_uct_comm_init(nccl_uct_comm_t *comm,
         return ncclSystemError;
     }
 
+#if 0
     comm->uct_ep_am = nccl_uct_ep_create(comm->uct_iface);
     if (comm->uct_ep_am == NULL) {
         return ncclSystemError;
     }
+#endif
 
     return ncclSuccess;
 }
@@ -1036,7 +1038,6 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
         NCCLCHECK(nccl_uct_comm_init(comm, &context, dev));
         stage->state = NCCL_UCT_RECEIVE_ADDR;
         NCCLCHECK(nccl_uct_ep_addr_set(&addr.rma, comm, comm->uct_ep));
-        NCCLCHECK(nccl_uct_ep_addr_set(&addr.am, comm, comm->uct_ep_am));
         /* TODO: Add EP addresses for multiple QPs */
         NCCLCHECK(ncclSocketSend(&comm->sock, &addr, sizeof(addr)));
         NCCLCHECK(ncclSocketSend(&comm->sock, &comm, sizeof(comm)));
@@ -1228,7 +1229,7 @@ static ncclResult_t nccl_uct_reg_mr(void *reg_comm, void *data, size_t size,
         return ncclInternalError;
     }
 
-    WARN("REGED memh %p %p/%zu rkey %x\n", uct_memh, addr, size, uct_memh->bundle.rkey);
+//    WARN("REGED memh %p %p/%zu rkey %x\n", uct_memh, addr, size, uct_memh->bundle.rkey);
     *mhandle = uct_memh;
     return ncclSuccess;
 }
@@ -1368,7 +1369,7 @@ static ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
     *request = NULL;
 
     for (rdesc = comm->rdesc_list.head; rdesc != NULL; rdesc = rdesc->next) {
-        WARN(" Try rdesc=%p count=%d", rdesc, rdesc->desc.count);
+        //WARN(" Try rdesc=%p count=%d", rdesc, rdesc->desc.count);
         for (i = 0; i < rdesc->desc.count; i++) {
             send_iter++;
             if (!rdesc->desc.chunk[i].done &&
@@ -1379,6 +1380,7 @@ static ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
     }
 
     if (rdesc == NULL) {
+        uct_worker_progress(comm->uct_worker->worker);
         goto out;
     }
 
@@ -1388,7 +1390,6 @@ found:
 //    WARN("VEG isend: rdesc tag 0x%x size=%d matched peer_rdesc=%p request=%p",
  //        tag, size, rdesc->desc.peer_rdesc, *request);
 out:
-    uct_worker_progress(comm->uct_worker->worker);
     return result;
 }
 
@@ -1527,11 +1528,11 @@ static ncclResult_t nccl_uct_test(void *request, int *done, int *sizes)
 //    WARN("TEST %p", request);
 
     //printf("TTEST comm->uct_worker %p tid %lld\n", comm->uct_worker, (long long ) pthread_self());
-    while (uct_worker_progress(comm->uct_worker->worker));
 
     if (rdesc->completion.count == 0) {
         goto conclude;
     }
+    while (uct_worker_progress(comm->uct_worker->worker));
 
     if (rdesc->send_atp && rdesc->completion.count == 1) {
         nccl_uct_send_atp(comm, rdesc);

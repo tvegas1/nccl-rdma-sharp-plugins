@@ -90,6 +90,7 @@ struct nccl_uct_comm;
 typedef struct {
     uint64_t              id;
     uint16_t              count;
+    uint16_t              first;
     uint32_t              size;
     struct nccl_uct_rdesc *peer_rdesc; /* Acts as a cookie along with id */
     nccl_uct_chunk_t      chunk[];
@@ -113,7 +114,7 @@ typedef struct {
 typedef struct nccl_uct_rdesc {
     uct_completion_t      completion; /* pending rx_ATP or all PUTs+tx_ATP */
     int                   nccl_usage; /* NCCL requests not finished/started */
-    int                   send_atp;
+    int                   send_atp; /* >1 pending isend, ==1 pending atp send */
 
     struct nccl_uct_rdesc *prev; /* comm's linked list */
     struct nccl_uct_rdesc *next;
@@ -515,13 +516,14 @@ static void nccl_uct_recv_desc_set(nccl_uct_rdesc_t *rdesc,
     assert(rkey_size <= sizeof(desc->chunk[0].rkey));
 
     desc->id         = id;
+    desc->first      = 0;
     desc->count      = n;
     desc->size       = nccl_uct_rdesc_size(n);
     desc->peer_rdesc = rdesc;
 
     rdesc->nccl_usage = 1;
     rdesc->send_atp   = 0;
-    nccl_uct_completion_init(&rdesc->completion, 1);
+    nccl_uct_completion_init(&rdesc->completion, 1); /* wait for ATP */
 
     for (i = 0; i < n; i++) {
         desc->chunk[i].tag  = tags[i];
@@ -583,7 +585,7 @@ static ucs_status_t nccl_uct_rtr_callback(void *arg, void *data, size_t length,
 
     memcpy(&rdesc->desc, desc, size);
     rdesc->nccl_usage = desc->count;
-    rdesc->send_atp   = 1;
+    rdesc->send_atp   = desc->count + 1;
     nccl_uct_completion_init(&rdesc->completion, desc->count + 1);
 
     //WARN("RX RTR: comm=%p rem_rdesc=%p id=%lu n=%u tag[0]=0x%x", comm, desc->peer_rdesc, desc->id, desc->count, rdesc->desc.chunk[0].tag);
@@ -1286,7 +1288,7 @@ static ucs_status_t nccl_uct_send_atp(nccl_uct_comm_t *comm,
     nccl_uct_atp_t atp;
     int i;
 
-    assert(rdesc->send_atp);
+    assert(rdesc->send_atp == 1);
 
     atp.id    = rdesc->desc.id;
     atp.rdesc = rdesc->desc.peer_rdesc;
@@ -1296,8 +1298,8 @@ static ucs_status_t nccl_uct_send_atp(nccl_uct_comm_t *comm,
         atp.sizes[i] = rdesc->reqs[i].size;
     }
 
-    //status = uct_ep_fence(comm->uct_ep->ep, 0);
-    //assert(status == UCS_OK);
+    status = uct_ep_fence(comm->uct_ep->ep, 0);
+    assert(status == UCS_OK);
 
     status = uct_ep_am_short(comm->uct_ep->ep, NCCL_UCT_AM_ATP,
                              (uint64_t)comm->remote_comm, &atp, sizeof(atp));
@@ -1340,17 +1342,17 @@ static ncclResult_t nccl_uct_send(nccl_uct_comm_t *comm, void *data, int size,
         return ncclSuccess;
     }
 
-    if (rdesc->desc.count == 1) {
-        assert(rdesc->send_atp != 0);
-
+    --rdesc->send_atp;
+    if (rdesc->send_atp == 1) {
         status = nccl_uct_send_atp(comm, rdesc);
-        if (status == UCS_OK) {
-            rdesc->send_atp = 0;
-        }
+        assert(status == UCS_OK);
+        rdesc->send_atp = 0;
+
+        nccl_uct_comm_rdesc_del(rdesc);
     }
 
-    nccl_uct_comm_rdesc_del(rdesc);
     rdesc->desc.chunk[i].done = 1;
+
     *request = nccl_uct_rdesc_get_req(rdesc, i, size); /* send request */
     send_count ++;
     return ncclSuccess;
@@ -1528,23 +1530,14 @@ static ncclResult_t nccl_uct_test(void *request, int *done, int *sizes)
 //    WARN("TEST %p", request);
 
     //printf("TTEST comm->uct_worker %p tid %lld\n", comm->uct_worker, (long long ) pthread_self());
-
-    if (rdesc->completion.count == 0) {
-        goto conclude;
-    }
-    while (uct_worker_progress(comm->uct_worker->worker));
-
-    if (rdesc->send_atp && rdesc->completion.count == 1) {
-        nccl_uct_send_atp(comm, rdesc);
-    }
+    uct_worker_progress(comm->uct_worker->worker);
 
     if (rdesc->completion.count > 0) {
         *done = 0;
         return ncclSuccess;
     }
 
-conclude:
-
+    assert(rdesc->send_atp == 0);
     assert(rdesc->completion.count == 0);
     *done = 1;
 

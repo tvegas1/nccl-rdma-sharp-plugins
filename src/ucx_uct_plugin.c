@@ -586,9 +586,9 @@ static ncclResult_t nccl_uct_iface_set_rtr_mode(nccl_uct_iface_t *uct_iface,
                                                 nccl_uct_comm_t *comm)
 {
     NCCLCHECK(nccl_uct_iface_set_handler(uct_iface, NCCL_UCT_AM_RTR,
-                                         nccl_uct_rtr_callback, comm));
+                                         nccl_uct_rtr_callback, NULL));
     NCCLCHECK(nccl_uct_iface_set_handler(uct_iface, NCCL_UCT_AM_ATP,
-                                         nccl_uct_atp_callback, comm));
+                                         nccl_uct_atp_callback, NULL));
     return ncclSuccess;
 }
 
@@ -731,9 +731,6 @@ found:
 
     uct_iface->iface = iface;
 
-    WARN("IFACE %p dlen %zu iface len %zu ep len %zu am_max_short %zu rkey_packed_size %zu", iface,
-         uct_iface->dev_addr_size, uct_iface->addr_size, uct_iface->ep_addr_size,
-         uct_iface->am_max_short, uct_iface->rkey_packed_size);
 out:
     uct_release_component_list(comps);
     return uct_iface;
@@ -757,7 +754,8 @@ static ncclResult_t nccl_uct_init(ncclDebugLogger_t logFunction)
                             &context.if_addr, NULL, logFunction);
 }
 
-static ncclResult_t nccl_uct_devices(int *ndev) {
+static ncclResult_t nccl_uct_devices(int *ndev)
+{
     *ndev = context.dev_count;
     return ncclSuccess;
 }
@@ -788,6 +786,7 @@ static ncclResult_t nccl_uct_worker_create(nccl_uct_worker_t *w,
         goto fail;
     }
 
+    /* TODO: Fix thread mode */
     status = uct_worker_create(w->async, UCS_THREAD_MODE_SINGLE,
                                &w->worker);
     if (status != UCS_OK) {
@@ -848,33 +847,6 @@ found:
 out:
     pthread_mutex_unlock(&nccl_uct_lock);
     return w;
-}
-
-static void nccl_uct_worker_destroy(nccl_uct_worker_t *w)
-{
-    nccl_uct_iface_close(w->uct_iface);
-    uct_worker_destroy(w->worker);
-    ucs_async_context_destroy(w->async);
-    free(w);
-}
-
-static void nccl_uct_worker_put(nccl_uct_worker_t *worker)
-{
-    nccl_uct_worker_t **wp;
-
-    pthread_mutex_lock(&nccl_uct_lock);
-    if (--worker->count < 1) {
-        assert(worker->count == 0);
-        for (wp = &worker->context->worker_list; *wp != NULL;
-             wp = &(*wp)->next) {
-            if (*wp == worker) {
-                *wp = worker->next;
-                nccl_uct_worker_destroy(worker);
-                break;
-            }
-        }
-    }
-    pthread_mutex_unlock(&nccl_uct_lock);
 }
 
 static ncclResult_t nccl_uct_listen(int dev, void *listen_handle,
@@ -1516,6 +1488,33 @@ static ncclResult_t nccl_uct_test(void *request, int *done, int *sizes)
     }
 
     return ncclSuccess;
+}
+
+static void nccl_uct_worker_destroy(nccl_uct_worker_t *w)
+{
+    nccl_uct_iface_close(w->uct_iface);
+    uct_worker_destroy(w->worker);
+    ucs_async_context_destroy(w->async);
+    free(w);
+}
+
+static void nccl_uct_worker_put(nccl_uct_worker_t *worker)
+{
+    nccl_uct_worker_t **wp;
+
+    pthread_mutex_lock(&nccl_uct_lock);
+    if (--worker->count < 1) {
+        assert(worker->count == 0);
+        for (wp = &worker->context->worker_list; *wp != NULL;
+             wp = &(*wp)->next) {
+            if (*wp == worker) {
+                *wp = worker->next;
+                nccl_uct_worker_destroy(worker);
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&nccl_uct_lock);
 }
 
 static ncclResult_t nccl_uct_close(void *close_comm)

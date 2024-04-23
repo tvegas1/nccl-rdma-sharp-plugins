@@ -161,7 +161,6 @@ typedef struct nccl_uct_comm {
     struct {
         int                 enabled;
         nccl_uct_ep_t       *uct_ep;    /* Locally read from HCA */
-        nccl_uct_ep_t       *uct_ep_rx; /* Locally read from HCA */ /*TODO remove */
         nccl_uct_ep_addr_t  addr;
 
         uint8_t             mem[512]; /* TODO shrink */
@@ -924,10 +923,15 @@ static ncclResult_t nccl_uct_close_listen(void *listen_comm)
 
 static ncclResult_t nccl_uct_comm_init(nccl_uct_comm_t *comm,
                                        nccl_uct_context_t *context,
+                                       nccl_uct_worker_t *worker,
                                        int dev,
                                        const nccl_uct_comm_t *remote_comm)
 {
-    comm->uct_worker = nccl_uct_worker_get(context, dev);
+    if (worker == NULL) {
+        worker = nccl_uct_worker_get(context, dev);
+    }
+
+    comm->uct_worker = worker;
     if (comm->uct_worker == NULL) {
         return ncclSystemError;
     }
@@ -944,11 +948,43 @@ static ncclResult_t nccl_uct_comm_init(nccl_uct_comm_t *comm,
     return ncclSuccess;
 }
 
+/* TODO recheck if still works with actual iflush */
+static ncclResult_t nccl_uct_comm_gpu_flush_init(nccl_uct_comm_t *comm)
+{
+    ucs_status_t status;
+
+    comm->gpu_flush.enabled =
+        (nccl_p2p_gdr_support(comm->dev) == ncclSuccess) ||
+        (nccl_p2p_dmabuf_support(comm->dev) == ncclSuccess);
+
+    if (!comm->gpu_flush.enabled) {
+        return ncclSuccess;
+    }
+
+    comm->gpu_flush.uct_ep  = nccl_uct_ep_create(comm->uct_iface);
+    if (comm->gpu_flush.uct_ep == NULL) {
+        return ncclSystemError;
+    }
+
+    NCCLCHECK(nccl_uct_ep_addr_set(&comm->gpu_flush.addr, comm,
+                                   comm->gpu_flush.uct_ep));
+    NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->gpu_flush.uct_ep,
+                                        &comm->gpu_flush.addr));
+
+    /* Remove when replaced by bcopy */
+    status = uct_md_mem_reg(comm->uct_iface->md,
+                            (void *)comm->gpu_flush.mem,
+                            sizeof(comm->gpu_flush.mem),
+                            UCT_MD_MEM_ACCESS_ALL,
+                            &comm->gpu_flush.memh);
+    return status == UCS_OK? ncclSuccess : ncclSystemError;
+}
+
 static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
                                      void **send_comm,
                                      ncclNetDeviceHandle_t** sendDevComm)
 {
-    int ready                        = 1;
+    int ready                        = 0;
     nccl_uct_listen_handle_t *handle = listen_handle;
     nccl_uct_stage_t *stage          = &handle->stage;
     nccl_uct_comm_t *comm            = stage->comm;
@@ -959,7 +995,7 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
     switch (stage->state) {
     case NCCL_UCT_START:
         NCCLCHECK(ncclIbMalloc((void **)&comm, sizeof(*comm)));
-        NCCLCHECK(nccl_uct_comm_init(comm, &context, dev, handle->comm));
+        NCCLCHECK(nccl_uct_comm_init(comm, &context, NULL, dev, handle->comm));
         NCCLCHECK(ncclSocketInit(&comm->sock, &handle->listener.addr,
                                  handle->magic, ncclSocketTypeNetIb, NULL, 1));
         NCCLCHECK(ncclSocketConnect(&comm->sock));
@@ -990,6 +1026,7 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
             return ncclSuccess; /* In progress */
         }
 
+        ready = 1;
         NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep, &comm->addr.rma));
         NCCLCHECK(ncclSocketSend(&comm->sock, &ready, sizeof(ready)));
 
@@ -1014,74 +1051,39 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
     nccl_uct_listen_comm_t *l_comm = listen_comm;
     nccl_uct_stage_t *stage        = &l_comm->stage;
     nccl_uct_comm_t *comm          = stage->comm;
-    nccl_uct_comm_addr_t addr; int ready;
-    ucs_status_t status;
-
+    nccl_uct_comm_addr_t addr;
+    int ready;
 
     *recv_comm = NULL;
 
     switch (stage->state) {
     case NCCL_UCT_START:
-        stage->comm  = l_comm->comm;
-        comm = stage->comm;
-        stage->state = NCCL_UCT_ACCEPT;
+        comm = l_comm->comm;
+
         NCCLCHECK(ncclSocketInit(&comm->sock, NULL, NCCL_SOCKET_MAGIC,
                                  ncclSocketTypeUnknown, NULL, 0));
-        NCCLCHECK(ncclSocketAccept(&stage->comm->sock, &l_comm->sock));
+        NCCLCHECK(ncclSocketAccept(&comm->sock, &l_comm->sock));
+        NCCLCHECK(nccl_uct_comm_init(comm, l_comm->context, l_comm->uct_worker,
+                                     l_comm->dev, NULL));
+        NCCLCHECK(nccl_uct_comm_gpu_flush_init(comm));
 
-        comm->dev        = l_comm->dev;
-        comm->context    = l_comm->context;
-        comm->uct_worker = l_comm->uct_worker;
-        comm->uct_iface  = comm->uct_worker->uct_iface;
-
-        comm->uct_ep     = nccl_uct_ep_create(comm->uct_iface);
-        if (comm->uct_ep == NULL) {
-            return ncclSystemError;
-        }
-
-        if ((nccl_p2p_gdr_support(comm->dev) == ncclSuccess) ||
-            (nccl_p2p_dmabuf_support(comm->dev) == ncclSuccess)) {
-            comm->gpu_flush.enabled = 1;
-            comm->gpu_flush.uct_ep_rx  = nccl_uct_ep_create(comm->uct_iface);
-            if (comm->gpu_flush.uct_ep_rx == NULL) {
-                return ncclSystemError;
-            }
-            comm->gpu_flush.uct_ep  = nccl_uct_ep_create(comm->uct_iface);
-            if (comm->gpu_flush.uct_ep == NULL) {
-                return ncclSystemError;
-            }
-            NCCLCHECK(nccl_uct_ep_addr_set(&comm->gpu_flush.addr, comm,
-                                           comm->gpu_flush.uct_ep_rx));
-            NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->gpu_flush.uct_ep,
-                                                &comm->gpu_flush.addr));
-            NCCLCHECK(nccl_uct_ep_addr_set(&comm->gpu_flush.addr, comm,
-                                           comm->gpu_flush.uct_ep));
-            NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->gpu_flush.uct_ep_rx,
-                                                &comm->gpu_flush.addr));
-
-            status = uct_md_mem_reg(comm->uct_iface->md,
-                                    (void *)comm->gpu_flush.mem, sizeof(comm->gpu_flush.mem),
-                                    UCT_MD_MEM_ACCESS_ALL,
-                                    &comm->gpu_flush.memh);
-            if (status != UCS_OK) {
-                return ncclSystemError;
-            }
-        }
+        stage->comm  = comm;
+        stage->state = NCCL_UCT_ACCEPT;
         /* fallthrough */
+
     case NCCL_UCT_ACCEPT:
         NCCLCHECK(ncclSocketReady(&comm->sock, &ready));
-        if (!ready) return ncclSuccess;
-
+        if (!ready) {
+            return ncclSuccess;
+        }
 
         NCCLCHECK(nccl_uct_ep_addr_set(&addr.rma, comm, comm->uct_ep));
         NCCLCHECK(ncclSocketSend(&comm->sock, &addr, sizeof(addr)));
 
-        WARN("accepted for dev=%d w=%p i=%p ep=%p",
-             l_comm->dev, comm->uct_worker, comm->uct_iface, comm->uct_ep);
-
+        stage->offset = 0;
         stage->state = NCCL_UCT_RECEIVE_ADDR;
         /* fallthrough */
-        stage->offset = 0;
+
     case NCCL_UCT_RECEIVE_ADDR:
         NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->sock,
                                      &comm->addr, sizeof(comm->addr),
@@ -1092,9 +1094,10 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
 
         NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep, &comm->addr.rma));
 
+        stage->offset = 0;
         stage->state = NCCL_UCT_RECEIVE_COMM;
         /* fallthrough */
-        stage->offset = 0;
+
     case NCCL_UCT_RECEIVE_COMM:
         NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->sock,
                                      &comm->remote_comm, sizeof(comm->remote_comm),
@@ -1102,10 +1105,11 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
         if (stage->offset != sizeof(comm->remote_comm)) {
             return ncclSuccess;
         }
-        stage->state = NCCL_UCT_RX_READY;
 
         stage->offset = 0;
-        stage->ready = 0;
+        stage->ready  = 0;
+        stage->state  = NCCL_UCT_RX_READY;
+        /* fallthrough */
 
    case NCCL_UCT_RX_READY:
         NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->sock,
@@ -1114,9 +1118,15 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
         if (stage->offset != sizeof(ready)) {
             return ncclSuccess;
         }
+        if (stage->ready != 1) {
+            WARN("Accepted comm=%p invalid status (ready=%d)", stage->ready);
+            return ncclSystemError;
+        }
+
+        *recv_comm   = comm;
         stage->state = NCCL_UCT_DONE;
-        WARN("accept rx'd");
-        *recv_comm = comm;
+        WARN("Accepted comm=%p remote_comm=%p listener_id=%d",
+             comm, comm->remote_comm, l_comm->id);
         break;
 
     default:
@@ -1522,7 +1532,6 @@ static ncclResult_t nccl_uct_close(void *close_comm)
     nccl_uct_ep_destroy(comm->uct_ep);
     if (comm->gpu_flush.uct_ep != NULL) {
         nccl_uct_ep_destroy(comm->gpu_flush.uct_ep);
-        nccl_uct_ep_destroy(comm->gpu_flush.uct_ep_rx);
         (void)uct_md_mem_dereg(comm->uct_iface->md,
                                comm->gpu_flush.memh);
     }

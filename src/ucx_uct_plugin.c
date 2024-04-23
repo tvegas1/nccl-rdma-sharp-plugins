@@ -167,7 +167,7 @@ typedef struct nccl_uct_comm {
         nccl_uct_ep_t       *uct_ep;    /* Locally read from HCA */
         nccl_uct_ep_addr_t  addr;
 
-        uint8_t             mem[65];    /* Dummy memory to read into */
+        uint8_t             mem[1];    /* Dummy memory to read into */
         uct_mem_h           memh;
     } gpu_flush;
 
@@ -1407,7 +1407,7 @@ static ncclResult_t nccl_uct_iflush(void *recv_comm, int n, void **data,
     iov.buffer  = comm->gpu_flush.mem;
     iov.length  = sizeof(comm->gpu_flush.mem);
     iov.memh    = comm->gpu_flush.memh;
-    iov.stride  = iov.length;
+    iov.stride  = 0;
     iov.count   = 1;
 
     status = uct_ep_get_zcopy(comm->gpu_flush.uct_ep->ep,

@@ -12,7 +12,10 @@
 
 #include <uct/api/uct.h>
 
-struct nccl_uct_context;
+
+#define NCCL_UCX_UCT_MAX_RECVS       NCCL_NET_IB_MAX_RECVS
+#define NCCL_UCT_LISTEN_HANDLE_MAGIC 0x43cf19ed91abdb85
+#define NCCL_UCT_REG_ALIGN           4096
 
 typedef enum {
     NCCL_UCT_START = 0,
@@ -26,14 +29,14 @@ typedef enum {
 
 typedef enum {
     NCCL_UCT_AM_RTR = 14, /* Use particular values */
-    NCCL_UCT_AM_ATP = 15,
+    NCCL_UCT_AM_ATP = 15
 } nccl_uct_am_type_t;
 
 /* UCT EP address to exchange and connect to */
 typedef struct {
-    uint8_t dev_addr_size;
-    uint8_t ep_addr_size;
-    uint8_t data[64]; /* TODO: Don't hardcode value, fix align */
+    uint8_t                 dev_addr_size;
+    uint8_t                 ep_addr_size;
+    uint8_t                 data[64];
 } nccl_uct_ep_addr_t;
 
 typedef struct {
@@ -50,14 +53,16 @@ typedef struct {
     size_t                  am_max_short;
 } nccl_uct_iface_t;
 
+struct nccl_uct_context;
+
 typedef struct nccl_uct_worker {
     struct nccl_uct_worker *next;
     struct {
-        pthread_t           thread;  /* TODO: double check that part */
+        pthread_t           thread;
         int                 dev;
     } id;
 
-    int                     count;   /* Usage count */
+    int                     count;
     ucs_async_context_t     *async;
     uct_worker_h            worker;
     nccl_uct_iface_t        *uct_iface;
@@ -72,26 +77,22 @@ typedef struct {
     uint8_t                 data[];
 } nccl_uct_ep_t;
 
-/* On-the-wire descriptor of a posted receive request entry */
-typedef struct {
-    int tag;
-    int size;
-    void *data;
-    int done;
-    uct_rkey_t rkey; /* TODO: Support bigger sizes */
-} nccl_uct_chunk_t;
-
 struct nccl_uct_rdesc;
 struct nccl_uct_comm;
 
-#define NCCL_UCX_UCT_MAX_RECVS NCCL_NET_IB_MAX_RECVS
-
+/* On-the-wire descriptor of a posted receive request entry */
+typedef struct {
+    int                     tag;
+    int                     size;
+    void                    *data;
+    int                     done;
+    uct_rkey_t              rkey;
+} nccl_uct_chunk_t;
 
 /* On-the-wire descriptor of a receive request containing many chunks */
 typedef struct {
     uint64_t              id;
     uint16_t              count;
-    uint16_t              first;
     uint32_t              size;
     struct nccl_uct_rdesc *peer_rdesc; /* Acts as a cookie along with id */
     nccl_uct_chunk_t      chunk[];
@@ -101,11 +102,16 @@ typedef struct {
 typedef struct {
     uint64_t              id;
     struct nccl_uct_rdesc *rdesc;
-    int                   count; /* Number of size contained */
+    int                   count; /* Number of sizes contained */
     int                   sizes[NCCL_UCX_UCT_MAX_RECVS];
 } nccl_uct_atp_t;
 
-/* NCCL Request, either for one multi-receive (size -1) or one send */
+/*
+ * NCCL local request handler to progress:
+ * - size -1 for multi receive
+ * - size -2 for flush
+ * - size > 0 for send
+ */
 typedef struct {
     int                   size;
     struct nccl_uct_rdesc *rdesc;
@@ -115,15 +121,15 @@ typedef struct {
 typedef struct nccl_uct_rdesc {
     uct_completion_t      completion; /* pending rx_ATP or all PUTs+tx_ATP */
     int                   nccl_usage; /* NCCL requests not finished/started */
-    int                   send_atp; /* >1 pending isend, ==1 pending atp send */
+    int                   send_atp;   /* >1 pending isend, ==1 pending atp send */
 
-    struct nccl_uct_rdesc *prev; /* comm's linked list */
+    struct nccl_uct_rdesc *prev;      /* comm's linked list */
     struct nccl_uct_rdesc *next;
 
     double                start;
     struct nccl_uct_comm  *comm;
     nccl_uct_rdesc_hdr_t  desc;
-    nccl_uct_chunk_t      storage[NCCL_UCX_UCT_MAX_RECVS]; /* Don't use */
+    nccl_uct_chunk_t      storage[NCCL_UCX_UCT_MAX_RECVS]; /* Don't use directly */
     nccl_uct_req_t        reqs[NCCL_UCX_UCT_MAX_RECVS];    /* NCCL requests */
     int                   sizes[NCCL_UCX_UCT_MAX_RECVS];   /* ATP received sizes */
 } nccl_uct_rdesc_t;
@@ -131,105 +137,103 @@ typedef struct nccl_uct_rdesc {
 /* All the remote addresses for the communicator */
 typedef struct nccl_uct_comm_addr {
     nccl_uct_ep_addr_t      rma;
-    nccl_uct_ep_addr_t      am;
+    /* TODO: Add multi-QP here */
 } nccl_uct_comm_addr_t;
 
+/* Either Receiver or Sender communicator, connected to one peer */
 typedef struct nccl_uct_comm {
     struct ncclSocket       sock;
     struct nccl_uct_context *context;
-    nccl_uct_worker_t       *uct_worker;
-
     int                     dev;
 
+    nccl_uct_worker_t       *uct_worker;
     nccl_uct_iface_t        *uct_iface;
     nccl_uct_ep_t           *uct_ep;
-    nccl_uct_ep_t           *uct_ep_am; /* TODO cleanup */
-    nccl_uct_comm_addr_t    addr; /* Remote addresses */
 
-    nccl_uct_rdesc_t        *free_rdesc; /* Available rdesc for reuse */
-    uint64_t                rdesc_id;
+    nccl_uct_comm_addr_t    addr;         /* Remote addresses */
 
-    struct nccl_uct_comm    *remote_comm;
+    nccl_uct_rdesc_t        *free_rdesc;  /* Available rdesc for reuse */
+    uint64_t                rdesc_id;     /* Next sequence number to use */
 
+    struct nccl_uct_comm    *remote_comm; /* Cookie received while connecting */
+
+    /* Local GET on current device */
     struct {
-        nccl_uct_ep_t       *uct_ep;    /* Locally read from HCA */
-        nccl_uct_ep_t       *uct_ep_rx; /* Locally read from HCA */
         int                 enabled;
+        nccl_uct_ep_t       *uct_ep;    /* Locally read from HCA */
+        nccl_uct_ep_t       *uct_ep_rx; /* Locally read from HCA */ /*TODO remove */
         nccl_uct_ep_addr_t  addr;
 
-        uint8_t mem[512];
+        uint8_t             mem[512]; /* TODO shrink */
         uct_mem_h           memh;
     } gpu_flush;
 
-    /* Pending rdesc, either rx/tx */
+    /* Received RTRs: used by Sender communicator in ->isend() */
     struct {
         nccl_uct_rdesc_t    *head;
         nccl_uct_rdesc_t    *tail;
     } rdesc_list;
 } nccl_uct_comm_t;
 
+/* State tracking used while connecting/accepting only */
 typedef struct {
-    nccl_uct_state_t state;
-    nccl_uct_comm_t  *comm;
-    int              offset;
+    nccl_uct_state_t        state;
+    nccl_uct_comm_t         *comm;  /* current communicator being created */
+    int                     offset; /* for Socket reading */
+    int                     ready;  /* accept must complete after connect */
 } nccl_uct_stage_t;
 
-/* Memory registration handle in NCCL UCT plugin */
+/* Memory registration handle in NCCL UCT plugin returned by ->regMR() */
 typedef struct {
-    uct_mem_h memh;
-    nccl_uct_comm_t *comm;
-    uct_rkey_bundle_t bundle;
-    uint8_t rkey[];
+    uct_mem_h               memh;
+    nccl_uct_comm_t         *comm;
+    uct_rkey_bundle_t       bundle;
+    uint8_t                 rkey[];
 } nccl_uct_memh_t;
 
-typedef uint64_t nccl_uct_tag_t;
-
-/* Passed around by NCCL */
+/* On-the-wire handle passed OOB by NCCL from listener to connector */
 typedef struct {
     uint64_t                    magic;
     struct {
         union ncclSocketAddress addr;
         uint32_t                id;
     } listener;
-    nccl_uct_comm_t             *comm;
-    nccl_uct_stage_t            stage;
+    nccl_uct_comm_t             *comm; /* Created communicator in accept */
+    nccl_uct_stage_t            stage; /* Used by connector */
 } nccl_uct_listen_handle_t;
 
 /* Communicator while listening to remote ranks */
 typedef struct {
+    struct ncclSocket       sock;
+    struct nccl_uct_context *context;
     int                     dev;
     uint32_t                id;
-    struct ncclSocket       sock;
-    nccl_uct_tag_t          tag; /* TODO: Are we able to remove that tag? */
     nccl_uct_worker_t       *uct_worker;
-    struct nccl_uct_context *context;
-
     nccl_uct_comm_t         *comm;
-    nccl_uct_stage_t  stage;
-    int accept_count;
-} nccl_uct_listen_comm_t;
 
-typedef struct {
-} nccl_uct_rx_desc_t;
+    /* Used by acceptor */
+    nccl_uct_stage_t        stage;
+} nccl_uct_listen_comm_t;
 
 /* Global state of the plugin */
 typedef struct nccl_uct_context {
+    /* Transport to use */
     const char              *tl_name;
 
-    int                     dev_count; /* How many available devices */
+    /* IB devices available */
+    int                     dev_count;
+
+    /* OOB socket for accepting/connecting */
     char                    if_name[MAX_IF_NAME_SIZE];
     union ncclSocketAddress if_addr;
 
-    uint32_t                listener_id; /* Listener ID allocation */
+    /* Number of listener created */
+    uint32_t                listener_count;
 
-    nccl_uct_worker_t       *worker_list; /* List of instantiated workers */
-
-    nccl_uct_tag_t          tag[MAX_IB_DEVS];
+    /* List of created workers */
+    nccl_uct_worker_t       *worker_list;
 } nccl_uct_context_t;
 
-#define NCCL_UCT_LISTEN_HANDLE_MAGIC 0x43cf19ed91abdb85
-
-#define NCCL_UCT_TAG_SHIFT 0x100
 
 static pthread_mutex_t nccl_uct_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -238,25 +242,13 @@ static nccl_uct_context_t context = {
     .dev_count = -1
 };
 
-static void nccl_uct_context_init(nccl_uct_context_t *context)
-{
-    for (int i = 0; i < MAX_IB_DEVS; i++) {
-        context->tag[i] = i;
-    }
-}
-
-static nccl_uct_tag_t nccl_uct_tag_get(nccl_uct_context_t *context, int dev)
-{
-    context->tag[dev] += NCCL_UCT_TAG_SHIFT;
-    return context->tag[dev];
-}
-
-static const uct_device_addr_t *nccl_uct_ep_addr_dev(nccl_uct_ep_addr_t *addr)
+static const uct_device_addr_t *
+nccl_uct_ep_addr_dev(const nccl_uct_ep_addr_t *addr)
 {
     return (uct_device_addr_t *)addr->data;
 }
 
-static const uct_ep_addr_t *nccl_uct_ep_addr_ep(nccl_uct_ep_addr_t *addr)
+static const uct_ep_addr_t *nccl_uct_ep_addr_ep(const nccl_uct_ep_addr_t *addr)
 {
     return (uct_ep_addr_t *)(addr->data + addr->dev_addr_size);
 }
@@ -288,10 +280,10 @@ static uct_iface_h nccl_uct_resource_iface_open(uct_worker_h worker,
                                                 uct_md_h md,
                                                 uct_tl_resource_desc_t *tl)
 {
+    uct_iface_params_t params = {};
     ucs_status_t status;
     uct_iface_config_t *config;
     uct_iface_h iface;
-    uct_iface_params_t params = {};
 
     status = uct_md_iface_config_read(md, tl->tl_name, NULL, NULL, &config);
     if (status != UCS_OK) {
@@ -308,8 +300,7 @@ static uct_iface_h nccl_uct_resource_iface_open(uct_worker_h worker,
     params.mode.device.tl_name  = tl->tl_name;
     params.mode.device.dev_name = tl->dev_name;
     params.stats_root           = NULL;
-    params.rx_headroom          = sizeof(nccl_uct_rx_desc_t);
-    params.features             = UCT_IFACE_FEATURE_FLUSH_REMOTE;
+    params.rx_headroom          = 0;
 
     status = uct_iface_open(md, worker, &params, config, &iface);
     uct_config_release(config);
@@ -386,6 +377,12 @@ out:
     return iface;
 }
 
+static void nccl_uct_ep_destroy(nccl_uct_ep_t *uct_ep)
+{
+    uct_ep_destroy(uct_ep->ep);
+    free(uct_ep);
+}
+
 static nccl_uct_ep_t *nccl_uct_ep_create(nccl_uct_iface_t *uct_iface)
 {
     nccl_uct_ep_t *uct_ep;
@@ -414,17 +411,11 @@ static nccl_uct_ep_t *nccl_uct_ep_create(nccl_uct_iface_t *uct_iface)
     status = uct_ep_get_address(uct_ep->ep, uct_ep->addr);
     if (status != UCS_OK) {
         WARN("Failed to get UCT EP address: error %d", status);
-        free(uct_ep);
+        nccl_uct_ep_destroy(uct_ep);
         return NULL;
     }
 
     return uct_ep;
-}
-
-static void nccl_uct_ep_destroy(nccl_uct_ep_t *uct_ep)
-{
-    uct_ep_destroy(uct_ep->ep);
-    free(uct_ep);
 }
 
 /* TODO: Use ring buffer of rdesc pointers instead */
@@ -504,34 +495,33 @@ static void nccl_uct_completion_init(uct_completion_t *completion, int count)
     completion->status = UCS_OK;
 }
 
-/* Prepare a receive descriptor from irecv() side */
+/* Prepare a receive descriptor from irecv()/iflush() side */
 static void nccl_uct_recv_desc_set(nccl_uct_rdesc_t *rdesc,
                                    uint64_t id, int n, void **data,
                                    int *sizes, int *tags,
                                    nccl_uct_memh_t **uct_memh)
 {
-    size_t rkey_size           = uct_memh[0]->comm->uct_iface->rkey_packed_size;
     nccl_uct_rdesc_hdr_t *desc = &rdesc->desc;
     int i;
 
-    (void)rkey_size;
-    assert(rkey_size <= sizeof(desc->chunk[0].rkey));
-
+    /* Populate header */
     desc->id         = id;
-    desc->first      = 0;
     desc->count      = n;
     desc->size       = nccl_uct_rdesc_size(n);
-    desc->peer_rdesc = rdesc;
+    desc->peer_rdesc = rdesc; /* cookie, will be returned in ATP */
 
+    /* Ref count that prevents NCCL from releasing memory */
     rdesc->nccl_usage = 1;
     rdesc->send_atp   = 0;
-    nccl_uct_completion_init(&rdesc->completion, 1); /* wait for ATP */
+    nccl_uct_completion_init(&rdesc->completion, 1); /* wait for ATP or Flush */
 
+    /* Zero (iflush) or One or many receive request are contained */
     for (i = 0; i < n; i++) {
         desc->chunk[i].tag  = tags[i];
         desc->chunk[i].size = sizes[i];
         desc->chunk[i].data = data[i];
         desc->chunk[i].done = 0;
+
         desc->chunk[i].rkey = uct_memh[i]->bundle.rkey;
     }
 }
@@ -550,9 +540,8 @@ static ucs_status_t nccl_uct_atp_callback(void *arg, void *data, size_t length,
                                           unsigned flags)
 {
     uint64_t magic        = nccl_uct_am_take_magic(&data, &length);
-    nccl_uct_atp_t *atp   = data;
+    nccl_uct_atp_t *atp = data;
 
-    //WARN("ATP Rx'd rdesc=%p id=%d desc.id=%d", atp->rdesc, atp->id, atp->rdesc->desc.id);
     (void)magic;
     assert(atp->id == atp->rdesc->desc.id);
     assert(atp->count == atp->rdesc->desc.count);
@@ -589,8 +578,6 @@ static ucs_status_t nccl_uct_rtr_callback(void *arg, void *data, size_t length,
     rdesc->nccl_usage = desc->count;
     rdesc->send_atp   = desc->count + 1;
     nccl_uct_completion_init(&rdesc->completion, desc->count + 1);
-
-    //WARN("RX RTR: comm=%p rem_rdesc=%p id=%lu n=%u tag[0]=0x%x", comm, desc->peer_rdesc, desc->id, desc->count, rdesc->desc.chunk[0].tag);
 
     return UCS_OK;
 }
@@ -710,15 +697,20 @@ found:
         goto fail;
     }
 
-    uct_iface->ep_addr_size = iface_attr.ep_addr_len;
-    uct_iface->md           = md;
-    uct_iface->comp         = *comp;
+    uct_iface->ep_addr_size     = iface_attr.ep_addr_len;
+    uct_iface->md               = md;
+    uct_iface->comp             = *comp;
+    uct_iface->rkey_packed_size = md_attr.rkey_packed_size;
 
     if (iface_attr.cap.flags & UCT_IFACE_FLAG_AM_SHORT) {
         uct_iface->am_max_short = iface_attr.cap.am.max_short;
     }
 
-    uct_iface->rkey_packed_size = md_attr.rkey_packed_size;
+    if (uct_iface->rkey_packed_size > sizeof(((nccl_uct_chunk_t *)0)->rkey)) {
+        WARN("Interface rkey_packed_size %d too big",
+             uct_iface->rkey_packed_size);
+        goto fail;
+    }
 
     if (iface_attr.device_addr_len > 0) {
         uct_iface->dev_addr_size = iface_attr.device_addr_len;
@@ -776,7 +768,6 @@ fail:
 
 static ncclResult_t nccl_uct_init(ncclDebugLogger_t logFunction)
 {
-    nccl_uct_context_init(&context);
     return nccl_p2p_ib_init(&context.dev_count, ncclIbDevs, context.if_name,
                             &context.if_addr, NULL, logFunction);
 }
@@ -805,7 +796,6 @@ static ncclResult_t nccl_uct_worker_create(nccl_uct_worker_t *w,
 {
     ucs_status_t status;
 
-    /* Create UCT objects */
     status = ucs_async_context_create(UCS_ASYNC_MODE_THREAD_SPINLOCK,
                                       &w->async);
     if (status != UCS_OK) {
@@ -821,20 +811,19 @@ static ncclResult_t nccl_uct_worker_create(nccl_uct_worker_t *w,
         goto fail;
     }
 
-    /* Initialize */
     w->id.dev     = dev;
     w->id.thread  = pthread_self();
-    w->context = context;
+    w->context    = context;
 
-    w->uct_iface = nccl_uct_iface_open(w, context->tl_name,
-                                       nccl_dev_name(dev));
+    w->uct_iface = nccl_uct_iface_open(w, context->tl_name, nccl_dev_name(dev));
     if (w->uct_iface == NULL) {
-        printf("FAILED!!!\n");
         WARN("Failed to create UCT iface for worker: dev=%d", dev);
+        uct_worker_destroy(w->worker);
+        ucs_async_context_destroy(w->async);
         goto fail;
     }
-    NCCLCHECK(nccl_uct_iface_set_rtr_mode(w->uct_iface, NULL));
 
+    NCCLCHECK(nccl_uct_iface_set_rtr_mode(w->uct_iface, NULL));
     return ncclSuccess;
 
 fail:
@@ -848,14 +837,11 @@ static nccl_uct_worker_t *nccl_uct_worker_get(nccl_uct_context_t *context,
 
     pthread_mutex_lock(&nccl_uct_lock);
 
-#if 1
     for (w = context->worker_list; w != NULL; w = w->next) {
-        goto out;
-        if ((w->id.dev == dev)) {// && (w->id.thread == pthread_self())) {
-            goto out;
+        if (w->id.dev == dev) {
+            goto found;
         }
     }
-#endif
 
     w = calloc(1, sizeof(*w));
     if (w == NULL) {
@@ -869,12 +855,12 @@ static nccl_uct_worker_t *nccl_uct_worker_get(nccl_uct_context_t *context,
         goto out;
     }
 
-    /* Add to worker list */
+found:
+    w->count++;
     w->next              = context->worker_list;
     context->worker_list = w;
 
 out:
-    w->count++;
     pthread_mutex_unlock(&nccl_uct_lock);
     return w;
 }
@@ -940,8 +926,7 @@ static ncclResult_t nccl_uct_listen(int dev, void *listen_handle,
     comm->comm       = accept_comm;
     comm->context    = &context;
     comm->dev        = dev;
-    comm->id         = context.listener_id++;
-    comm->tag        = nccl_uct_tag_get(&context, dev);
+    comm->id         = context.listener_count++;
 
     *listen_comm = comm;
 
@@ -959,7 +944,6 @@ static ncclResult_t nccl_uct_close_listen(void *listen_comm)
 {
     nccl_uct_listen_comm_t *comm = listen_comm;
 
-    WARN("CLOSE listen accept count %d", comm->accept_count);
     if (comm) {
         NCCLCHECK(ncclSocketClose(&comm->sock));
         free(comm);
@@ -985,13 +969,6 @@ static ncclResult_t nccl_uct_comm_init(nccl_uct_comm_t *comm,
     if (comm->uct_ep == NULL) {
         return ncclSystemError;
     }
-
-#if 0
-    comm->uct_ep_am = nccl_uct_ep_create(comm->uct_iface);
-    if (comm->uct_ep_am == NULL) {
-        return ncclSystemError;
-    }
-#endif
 
     return ncclSuccess;
 }
@@ -1060,7 +1037,6 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
         }
 
         NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep, &comm->addr.rma));
-        //NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep_am, &comm->addr.am));
         WARN("connect rx'd");
         stage->state = NCCL_UCT_DONE;
         *send_comm = comm;
@@ -1094,7 +1070,6 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
         stage->comm  = l_comm->comm;
         comm = stage->comm;
         stage->state = NCCL_UCT_ACCEPT;
-        l_comm->accept_count++;
         NCCLCHECK(ncclSocketInit(&comm->sock, NULL, NCCL_SOCKET_MAGIC,
                                  ncclSocketTypeUnknown, NULL, 0));
         NCCLCHECK(ncclSocketAccept(&stage->comm->sock, &l_comm->sock));
@@ -1108,13 +1083,6 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
         if (comm->uct_ep == NULL) {
             return ncclSystemError;
         }
-
-#if 0
-        comm->uct_ep_am  = nccl_uct_ep_create(comm->uct_iface);
-        if (comm->uct_ep_am == NULL) {
-            return ncclSystemError;
-        }
-#endif
 
         if ((nccl_p2p_gdr_support(comm->dev) == ncclSuccess) ||
             (nccl_p2p_dmabuf_support(comm->dev) == ncclSuccess)) {
@@ -1151,7 +1119,6 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
 
 
         NCCLCHECK(nccl_uct_ep_addr_set(&addr.rma, comm, comm->uct_ep));
-        //NCCLCHECK(nccl_uct_ep_addr_set(&addr.am, comm, comm->uct_ep_am));
         NCCLCHECK(ncclSocketSend(&comm->sock, &addr, sizeof(addr)));
 
         WARN("accepted for dev=%d w=%p i=%p ep=%p",
@@ -1169,7 +1136,6 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
         }
 
         NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep, &comm->addr.rma));
-        //NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep_am, &comm->addr.am));
 
         stage->state = NCCL_UCT_RECEIVE_COMM;
         /* fallthrough */
@@ -1206,8 +1172,6 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
 
     return ncclSuccess;
 }
-
-#define NCCL_UCT_REG_ALIGN 4096
 
 static ncclResult_t nccl_uct_reg_mr(void *reg_comm, void *data, size_t size,
                                     int type, void **mhandle)
@@ -1409,16 +1373,10 @@ static ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
 found:
 
     result = nccl_uct_send(comm, data, size, uct_memh, rdesc, i, request);
-//    WARN("VEG isend: rdesc tag 0x%x size=%d matched peer_rdesc=%p request=%p",
- //        tag, size, rdesc->desc.peer_rdesc, *request);
 out:
     return result;
 }
 
-/*
- * Sender side:
- * 1. perform series of put, ack when all of them have completed
- */
 static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
                                    int *sizes, int *tags, void **mhandles,
                                    void **request)
@@ -1434,18 +1392,11 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
     assert(n <= NCCL_UCX_UCT_MAX_RECVS);
     assert(length <= comm->uct_iface->am_max_short);
 
-    /*
-     * Receiver side:
-     * 1. Prepare uct receive
-     * 2. Use packed key from mhandle
-     * 3. Send or early return
-     * 4. Return as a request
-     */
-
     rdesc = nccl_uct_comm_rdesc_get(comm);
     if (rdesc == NULL) {
         return ncclInternalError;
     }
+    nccl_uct_comm_rdesc_del(rdesc);
 
     id = comm->rdesc_id++;
     nccl_uct_recv_desc_set(rdesc, id, n, data, sizes, tags, uct_memh);
@@ -1453,14 +1404,10 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
     status = uct_ep_am_short(uct_ep->ep, NCCL_UCT_AM_RTR, (uint64_t)comm->remote_comm,
                              &rdesc->desc, length);
     if (status != UCS_OK) {
-        nccl_uct_comm_rdesc_del(rdesc);
         nccl_uct_comm_rdesc_put(rdesc);
         *request = NULL;
     } else {
-        nccl_uct_comm_rdesc_del(rdesc);
         *request = nccl_uct_rdesc_get_req(rdesc, 0, -1); /* receive request */
-        //WARN("VEG irecv: rdesc=%p id=%d n=%d tag[0]=%d sizes[0]=%d",
-         //    rdesc, rdesc->desc.id, n, tags[0], sizes[0]);
     }
 
     return ncclSuccess;
@@ -1590,15 +1537,7 @@ static ncclResult_t nccl_uct_close(void *close_comm)
 {
     nccl_uct_comm_t *comm = close_comm;
 
-#if 0
-    printf(" pid %d UCT closing flush count=%zu total_flush=%lf count=%d/%d duration=%lf"
-           "send_count=%d send_iter=%d\n",
-       (int)getpid(), iflush_count, total_flush, flush_start, flush_end, total_flush / flush_start,
-       send_count, send_iter);
-#endif
-
     nccl_uct_ep_destroy(comm->uct_ep);
-    //nccl_uct_ep_destroy(comm->uct_ep_am);
     if (comm->gpu_flush.uct_ep != NULL) {
         nccl_uct_ep_destroy(comm->gpu_flush.uct_ep);
         nccl_uct_ep_destroy(comm->gpu_flush.uct_ep_rx);

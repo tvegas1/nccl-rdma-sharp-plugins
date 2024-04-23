@@ -1316,22 +1316,6 @@ ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* ta
   return ncclSuccess;
 }
 
-static uint64_t iflush_count = 0;
-
-#include <time.h>
-#include <stdio.h>
-
-static double total_flush = 0;
-static int flush_start = 0;
-static int flush_end = 0;
-
-static double gettime(void)
-{
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  return (double)tv.tv_sec * 1000 * 1000 + (double)tv.tv_usec;
-}
-
 ncclResult_t ncclIbIflush(void* recvComm, int n, void** data, int* sizes, void** mhandles, void** request) {
   struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
   int last = -1;
@@ -1344,9 +1328,6 @@ ncclResult_t ncclIbIflush(void* recvComm, int n, void** data, int* sizes, void**
   req->type = NCCL_NET_IB_REQ_FLUSH;
   req->sock = &comm->base.sock;
   struct ncclIbMrHandle* mhandle = (struct ncclIbMrHandle*) mhandles[last];
-
-  flush_start++;
-  req->start = gettime();
 
   // We don't know which devIndex the recv was on, so we flush on all devices
   for (int i = 0; i < comm->base.ndevs; i++) {
@@ -1361,10 +1342,10 @@ ncclResult_t ncclIbIflush(void* recvComm, int n, void** data, int* sizes, void**
     wr.opcode = IBV_WR_RDMA_READ;
     wr.send_flags = IBV_SEND_SIGNALED;
 
-
+    TIME_START(4);
     struct ibv_send_wr* bad_wr;
-    iflush_count++;
     NCCLCHECK(wrap_ibv_post_send(comm->devs[i].gpuFlush.qp.qp, &wr, &bad_wr));
+    TIME_STOP(4);
     ncclIbAddEvent(req, i, &comm->devs[i].base);
   }
 
@@ -1391,10 +1372,6 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
         sizes[0] = r->send.size;
       }
 
-      if (r->type == NCCL_NET_IB_REQ_FLUSH) {
-          flush_end++;
-          total_flush += gettime() - r->start;
-      }
       NCCLCHECK(ncclIbFreeRequest(r));
       return ncclSuccess;
     }
@@ -1470,10 +1447,6 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
 }
 
 ncclResult_t ncclIbCloseSend(void* sendComm) {
-#if 0
-printf(" IB closing flush count=%zu total_flush=%lf count=%d/%d duration=%lf\n",
-       iflush_count, total_flush, flush_start, flush_end, total_flush / flush_start);
-#endif
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
   if (comm) {
     NCCLCHECK(ncclSocketClose(&comm->base.sock));

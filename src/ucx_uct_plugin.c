@@ -32,6 +32,11 @@ typedef enum {
     NCCL_UCT_AM_ATP = 15
 } nccl_uct_am_type_t;
 
+typedef enum {
+    NCCL_UCT_REQ_IRECV  = -1,
+    NCCL_UCT_REQ_IFLUSH = -2
+} nccl_uct_request_type_t;
+
 /* UCT EP address to exchange and connect to */
 typedef struct {
     uint8_t                 dev_addr_size;
@@ -126,7 +131,6 @@ typedef struct nccl_uct_rdesc {
     struct nccl_uct_rdesc *prev;      /* comm's linked list */
     struct nccl_uct_rdesc *next;
 
-    double                start;
     struct nccl_uct_comm  *comm;
     nccl_uct_rdesc_hdr_t  desc;
     nccl_uct_chunk_t      storage[NCCL_UCX_UCT_MAX_RECVS]; /* Don't use directly */
@@ -1365,27 +1369,10 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
         nccl_uct_comm_rdesc_put(rdesc);
         *request = NULL;
     } else {
-        *request = nccl_uct_rdesc_get_req(rdesc, 0, -1); /* receive request */
+        *request = nccl_uct_rdesc_get_req(rdesc, 0, NCCL_UCT_REQ_IRECV);
     }
 
     return ncclSuccess;
-}
-
-static uint64_t iflush_count = 0;
-
-#include <sys/time.h>
-#include <time.h>
-#include <stdio.h>
-
-static double total_flush = 0;
-static int flush_start = 0;
-static int flush_end = 0;
-
-static double gettime(void)
-{
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  return (double)tv.tv_sec * 1000 * 1000 + (double)tv.tv_usec;
 }
 
 static ncclResult_t nccl_uct_iflush(void *recv_comm, int n, void **data,
@@ -1415,10 +1402,7 @@ static ncclResult_t nccl_uct_iflush(void *recv_comm, int n, void **data,
     if (rdesc == NULL) {
         return ncclInternalError;
     }
-    flush_start++;
-    rdesc->start = gettime();
 
-    nccl_uct_comm_rdesc_del(rdesc);
     nccl_uct_rdesc_set(rdesc, ~0, 0, NULL, NULL, NULL, &uct_memh[last]); /* TODO: cleanup */
 
     iov.buffer  = comm->gpu_flush.mem;
@@ -1427,21 +1411,19 @@ static ncclResult_t nccl_uct_iflush(void *recv_comm, int n, void **data,
     iov.stride  = iov.length;
     iov.count   = 1;
 
-    iflush_count++;
     status = uct_ep_get_zcopy(comm->gpu_flush.uct_ep->ep,
                               &iov, 1, 
                               (uint64_t)data[last], uct_memh[last]->bundle.rkey,
                               &rdesc->completion);
-    /* TODO: Handle failure to submit, or make QPs big enough anyways */
     if (status == UCS_OK) {
         *request = NULL;
         nccl_uct_comm_rdesc_put(rdesc);
     } else if (status == UCS_INPROGRESS) {
-        *request = nccl_uct_rdesc_get_req(rdesc, 0, -2); /* flush request */
+        *request = nccl_uct_rdesc_get_req(rdesc, 0, NCCL_UCT_REQ_IFLUSH);
     } else {
+        WARN("Failed to flush local ep comm=%p", comm);
         return ncclInternalError;
     }
-
 
     return ncclSuccess;
 }
@@ -1452,10 +1434,11 @@ static ncclResult_t nccl_uct_test(void *request, int *done, int *sizes)
     nccl_uct_rdesc_t *rdesc = req->rdesc;
     nccl_uct_comm_t *comm   = rdesc->comm;
 
-//    WARN("TEST %p", request);
-
-    //printf("TTEST comm->uct_worker %p tid %lld\n", comm->uct_worker, (long long ) pthread_self());
     uct_worker_progress(comm->uct_worker->worker);
+
+    if (rdesc->send_atp == 1) {
+        nccl_uct_send_atp(comm, rdesc);
+    }
 
     if (rdesc->completion.count > 0) {
         *done = 0;
@@ -1466,18 +1449,16 @@ static ncclResult_t nccl_uct_test(void *request, int *done, int *sizes)
     assert(rdesc->completion.count == 0);
     *done = 1;
 
-    if (req->size == -1) {
-        /* irecv() request */
+    if (req->size == NCCL_UCT_REQ_IRECV) {
         assert(&rdesc->reqs[0] == req);
         if (sizes != NULL) {
             memcpy(sizes, rdesc->sizes, rdesc->desc.count * sizeof(*sizes));
         }
-    } else if (req->size == -2) {
-        /* iflush request */
-          flush_end++;
-          total_flush += gettime() - rdesc->start;
+    } else if (req->size == NCCL_UCT_REQ_IFLUSH) {
+        assert(&rdesc->reqs[0] == req);
     } else {
-        /* isend() request */
+        /* ->isend() request */
+        assert(req->size > -1);
         if (sizes != NULL) {
             sizes[0] = req->size;
         }
@@ -1521,6 +1502,7 @@ static void nccl_uct_worker_put(nccl_uct_worker_t *worker)
 static ncclResult_t nccl_uct_close(void *close_comm)
 {
     nccl_uct_comm_t *comm = close_comm;
+    nccl_uct_rdesc_t *rdesc;
 
     nccl_uct_ep_destroy(comm->uct_ep);
     if (comm->gpu_flush.uct_ep != NULL) {
@@ -1529,6 +1511,14 @@ static ncclResult_t nccl_uct_close(void *close_comm)
                                comm->gpu_flush.memh);
     }
     nccl_uct_worker_put(comm->uct_worker);
+
+    while ((rdesc = comm->free_rdesc) != NULL) {
+        comm->free_rdesc = rdesc->next;
+        free(rdesc);
+    }
+
+    assert(comm->rdesc_list.head == NULL);
+    assert(comm->rdesc_list.tail == NULL);
     free(comm);
 
     return ncclSuccess;

@@ -85,7 +85,7 @@ typedef struct {
     int                     tag;
     int                     size;
     void                    *data;
-    int                     done;
+    int                     matched;
     uct_rkey_t              rkey;
 } nccl_uct_chunk_t;
 
@@ -499,10 +499,10 @@ static void nccl_uct_rdesc_set(nccl_uct_rdesc_t *rdesc,
 
     /* Zero (iflush) or One or many receive request are contained */
     for (i = 0; i < n; i++) {
-        desc->chunk[i].tag  = tags[i];
-        desc->chunk[i].size = sizes[i];
-        desc->chunk[i].data = data[i];
-        desc->chunk[i].done = 0;
+        desc->chunk[i].tag     = tags[i];
+        desc->chunk[i].size    = sizes[i];
+        desc->chunk[i].data    = data[i];
+        desc->chunk[i].matched = 0;
 
         desc->chunk[i].rkey = uct_memh[i]->bundle.rkey;
     }
@@ -1228,8 +1228,8 @@ static ncclResult_t nccl_uct_dereg_mr(void *dereg_comm, void *mhandle)
     return ncclSuccess;
 }
 
-static ucs_status_t nccl_uct_send_atp(nccl_uct_comm_t *comm,
-                                      nccl_uct_rdesc_t *rdesc)
+static void nccl_uct_send_atp(nccl_uct_comm_t *comm,
+                              nccl_uct_rdesc_t *rdesc)
 {
     ucs_status_t status;
     nccl_uct_atp_t atp;
@@ -1237,28 +1237,28 @@ static ucs_status_t nccl_uct_send_atp(nccl_uct_comm_t *comm,
 
     assert(rdesc->send_atp == 1);
 
+    status = uct_ep_fence(comm->uct_ep->ep, 0);
+    if (status != UCS_OK) {
+        return;
+    }
+
     atp.id    = rdesc->desc.id;
     atp.rdesc = rdesc->desc.peer_rdesc;
     atp.count = rdesc->desc.count;
 
+    /* Sizes from isend() are lower or equal to their irecv() side */
     for (i = 0; i < rdesc->desc.count; i++) {
         atp.sizes[i] = rdesc->reqs[i].size;
     }
-
-    status = uct_ep_fence(comm->uct_ep->ep, 0);
-    assert(status == UCS_OK);
 
     status = uct_ep_am_short(comm->uct_ep->ep, NCCL_UCT_AM_ATP,
                              (uint64_t)comm->remote_comm, &atp, sizeof(atp));
     if (status == UCS_OK) {
         rdesc->completion.count--;
+        rdesc->send_atp = 0;
     }
-
-    return status;
 }
 
-static int send_count;
-static int send_iter;
 static ncclResult_t nccl_uct_send(nccl_uct_comm_t *comm, void *data, int size,
                                   nccl_uct_memh_t *uct_memh,
                                   nccl_uct_rdesc_t *rdesc, int i,
@@ -1289,55 +1289,41 @@ static ncclResult_t nccl_uct_send(nccl_uct_comm_t *comm, void *data, int size,
         return ncclSuccess;
     }
 
+    rdesc->desc.chunk[i].matched = 1;
     --rdesc->send_atp;
-    if (rdesc->send_atp == 1) {
-        status = nccl_uct_send_atp(comm, rdesc);
-        assert(status == UCS_OK);
-        rdesc->send_atp = 0;
 
-        nccl_uct_comm_rdesc_del(rdesc);
+    if (rdesc->send_atp == 1) {
+        nccl_uct_comm_rdesc_del(rdesc); /* all ->isend() were now matched */
+        nccl_uct_send_atp(comm, rdesc);
     }
 
-    rdesc->desc.chunk[i].done = 1;
-
-    *request = nccl_uct_rdesc_get_req(rdesc, i, size); /* send request */
-    send_count ++;
+    *request = nccl_uct_rdesc_get_req(rdesc, i, size); /* NCCL request */
     return ncclSuccess;
 }
 
 static ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
                                    int tag, void *mhandle, void **request)
 {
-    nccl_uct_comm_t *comm     = send_comm;
-    nccl_uct_memh_t *uct_memh = mhandle;
+    nccl_uct_comm_t *comm = send_comm;
     nccl_uct_rdesc_t *rdesc;
-    ncclResult_t result = ncclSuccess;
     int i;
-//    WARN("ISEND comm=%p %p/%zu tag %d", comm, data, size, tag);
 
     *request = NULL;
 
     for (rdesc = comm->rdesc_list.head; rdesc != NULL; rdesc = rdesc->next) {
-        //WARN(" Try rdesc=%p count=%d", rdesc, rdesc->desc.count);
         for (i = 0; i < rdesc->desc.count; i++) {
-            send_iter++;
-            if (!rdesc->desc.chunk[i].done &&
-                (rdesc->desc.chunk[i].tag == tag)) {
-                goto found;
+            if (rdesc->desc.chunk[i].matched ||
+                (rdesc->desc.chunk[i].tag != tag)) {
+                continue;
             }
+
+            return nccl_uct_send(comm, data, size, mhandle, rdesc, i, request);
         }
     }
 
-    if (rdesc == NULL) {
-        uct_worker_progress(comm->uct_worker->worker);
-        goto out;
-    }
-
-found:
-
-    result = nccl_uct_send(comm, data, size, uct_memh, rdesc, i, request);
-out:
-    return result;
+    /* Progress here to make sure we receive non-solicited RTRs */
+    uct_worker_progress(comm->uct_worker->worker);
+    return ncclSuccess;
 }
 
 static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,

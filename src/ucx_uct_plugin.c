@@ -20,6 +20,7 @@ typedef enum {
     NCCL_UCT_ACCEPT,
     NCCL_UCT_RECEIVE_COMM,
     NCCL_UCT_RECEIVE_ADDR,
+    NCCL_UCT_RX_READY,
     NCCL_UCT_DONE
 } nccl_uct_state_t;
 
@@ -205,6 +206,7 @@ typedef struct {
 
     nccl_uct_comm_t         *comm;
     nccl_uct_stage_t  stage;
+    int accept_count;
 } nccl_uct_listen_comm_t;
 
 typedef struct {
@@ -957,6 +959,7 @@ static ncclResult_t nccl_uct_close_listen(void *listen_comm)
 {
     nccl_uct_listen_comm_t *comm = listen_comm;
 
+    WARN("CLOSE listen accept count %d", comm->accept_count);
     if (comm) {
         NCCLCHECK(ncclSocketClose(&comm->sock));
         free(comm);
@@ -1027,6 +1030,7 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
         NCCLCHECK(ncclSocketConnect(&comm->sock));
 
         comm->remote_comm = handle->comm;
+        NCCLCHECK(nccl_uct_comm_init(comm, &context, dev));
 
         stage->comm  = comm;
         stage->state = NCCL_UCT_CONNECT;
@@ -1037,9 +1041,8 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
             return ncclSuccess;
         }
 
-        NCCLCHECK(nccl_uct_comm_init(comm, &context, dev));
-        stage->state = NCCL_UCT_RECEIVE_ADDR;
         NCCLCHECK(nccl_uct_ep_addr_set(&addr.rma, comm, comm->uct_ep));
+        stage->state = NCCL_UCT_RECEIVE_ADDR;
         /* TODO: Add EP addresses for multiple QPs */
         NCCLCHECK(ncclSocketSend(&comm->sock, &addr, sizeof(addr)));
         NCCLCHECK(ncclSocketSend(&comm->sock, &comm, sizeof(comm)));
@@ -1061,6 +1064,8 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
         WARN("connect rx'd");
         stage->state = NCCL_UCT_DONE;
         *send_comm = comm;
+        ready = 1;
+        NCCLCHECK(ncclSocketSend(&comm->sock, &ready, sizeof(ready)));
         break;
 
     default:
@@ -1081,6 +1086,7 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
     nccl_uct_comm_addr_t addr; int ready;
     ucs_status_t status;
 
+
     *recv_comm = NULL;
 
     switch (stage->state) {
@@ -1088,13 +1094,10 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
         stage->comm  = l_comm->comm;
         comm = stage->comm;
         stage->state = NCCL_UCT_ACCEPT;
+        l_comm->accept_count++;
         NCCLCHECK(ncclSocketInit(&comm->sock, NULL, NCCL_SOCKET_MAGIC,
                                  ncclSocketTypeUnknown, NULL, 0));
         NCCLCHECK(ncclSocketAccept(&stage->comm->sock, &l_comm->sock));
-        /* fallthrough */
-    case NCCL_UCT_ACCEPT:
-        NCCLCHECK(ncclSocketReady(&comm->sock, &ready));
-        if (!ready) return ncclSuccess;
 
         comm->dev        = l_comm->dev;
         comm->context    = l_comm->context;
@@ -1141,6 +1144,11 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
                 return ncclSystemError;
             }
         }
+        /* fallthrough */
+    case NCCL_UCT_ACCEPT:
+        NCCLCHECK(ncclSocketReady(&comm->sock, &ready));
+        if (!ready) return ncclSuccess;
+
 
         NCCLCHECK(nccl_uct_ep_addr_set(&addr.rma, comm, comm->uct_ep));
         //NCCLCHECK(nccl_uct_ep_addr_set(&addr.am, comm, comm->uct_ep_am));
@@ -1151,8 +1159,8 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
 
         stage->state = NCCL_UCT_RECEIVE_ADDR;
         /* fallthrough */
-    case NCCL_UCT_RECEIVE_ADDR:
         stage->offset = 0;
+    case NCCL_UCT_RECEIVE_ADDR:
         NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->sock,
                                      &comm->addr, sizeof(comm->addr),
                                      &stage->offset));
@@ -1165,17 +1173,29 @@ static ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
 
         stage->state = NCCL_UCT_RECEIVE_COMM;
         /* fallthrough */
-    case NCCL_UCT_RECEIVE_COMM:
         stage->offset = 0;
+    case NCCL_UCT_RECEIVE_COMM:
         NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->sock,
                                      &comm->remote_comm, sizeof(comm->remote_comm),
                                      &stage->offset));
         if (stage->offset != sizeof(comm->remote_comm)) {
             return ncclSuccess;
         }
-        *recv_comm = comm;
+        stage->state = NCCL_UCT_RX_READY;
+
+        stage->offset = 0;
+        stage->ready = 0;
+
+   case NCCL_UCT_RX_READY:
+        NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->sock,
+                                     &stage->ready, sizeof(stage->ready),
+                                     &stage->offset));
+        if (stage->offset != sizeof(ready)) {
+            return ncclSuccess;
+        }
         stage->state = NCCL_UCT_DONE;
         WARN("accept rx'd");
+        *recv_comm = comm;
         break;
 
     default:

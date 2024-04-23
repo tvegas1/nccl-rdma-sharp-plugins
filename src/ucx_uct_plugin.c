@@ -418,7 +418,6 @@ static nccl_uct_ep_t *nccl_uct_ep_create(nccl_uct_iface_t *uct_iface)
     return uct_ep;
 }
 
-/* TODO: Use ring buffer of rdesc pointers instead */
 static nccl_uct_rdesc_t *
 nccl_uct_comm_rdesc_get(nccl_uct_comm_t *comm)
 {
@@ -526,16 +525,6 @@ static void nccl_uct_recv_desc_set(nccl_uct_rdesc_t *rdesc,
     }
 }
 
-static uint64_t nccl_uct_am_take_magic(void **data, size_t *length)
-{
-    uint64_t magic = *(uint64_t *)*data;
-
-    assert(*length >= sizeof(magic));
-    *(uint8_t **)data += sizeof(magic);
-    *length -= sizeof(magic);
-    return magic;
-}
-
 /* On receiver side, after ->irecv(), expect corresponding ATP */
 static ucs_status_t nccl_uct_atp_callback(void *arg, void *data, size_t length,
                                           unsigned flags)
@@ -553,32 +542,28 @@ static ucs_status_t nccl_uct_atp_callback(void *arg, void *data, size_t length,
     return UCS_OK;
 }
 
-/* Prepare a receive descriptor from isend() side */
+/* On sender side, asynchronously receive rdesc/RTR, later used by ->isend() */
 static ucs_status_t nccl_uct_rtr_callback(void *arg, void *data, size_t length,
                                           unsigned flags)
 {
-    nccl_uct_comm_t *comm      = arg;
-    uint64_t magic             = nccl_uct_am_take_magic(&data, &length);
-    nccl_uct_rdesc_hdr_t *desc = data;
+    nccl_uct_comm_t *comm      = *(nccl_uct_comm_t **)data;
+    nccl_uct_rdesc_hdr_t *desc = (nccl_uct_rdesc_hdr_t *)((uint8_t *)data + 8);
     size_t size                = desc->size;
     nccl_uct_rdesc_t *rdesc;
 
-    comm = (void *)magic;
     rdesc = nccl_uct_comm_rdesc_get(comm);
-
     if (rdesc == NULL) {
         WARN("Failed to get an rdesc in RTR callback");
-        return UCS_OK;
+        return UCS_ERR_NO_MEMORY; /* Cannot happend */
     }
 
-    (void)magic;
-    assert((size == length) && (size == nccl_uct_rdesc_size(desc->count)));
+    assert((size + 8) == length);
+    assert(size == nccl_uct_rdesc_size(desc->count));
 
     memcpy(&rdesc->desc, desc, size);
     rdesc->nccl_usage = desc->count;
     rdesc->send_atp   = desc->count + 1;
     nccl_uct_completion_init(&rdesc->completion, desc->count + 1);
-
     return UCS_OK;
 }
 

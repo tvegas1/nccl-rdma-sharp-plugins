@@ -853,47 +853,47 @@ static ncclResult_t nccl_uct_listen(int dev, void *listen_handle,
                                     void **listen_comm)
 {
     nccl_uct_listen_handle_t *handle = listen_handle;
-    nccl_uct_listen_comm_t   *comm   = calloc(1, sizeof(*comm));
+    nccl_uct_listen_comm_t   *l_comm = calloc(1, sizeof(*l_comm));
     nccl_uct_comm_t *accept_comm;
     union ncclSocketAddress addr;
 
-    if (comm == NULL) {
+    if (l_comm == NULL) {
         WARN("Failed to alloc UCT listener(dev=%d)", dev);
         return ncclSystemError;
     }
 
     NCCL_STATIC_ASSERT(
-                       sizeof(nccl_uct_listen_handle_t) < NCCL_NET_HANDLE_MAXSIZE,
-                       "UCT listen handle is too big");
+                   sizeof(nccl_uct_listen_handle_t) < NCCL_NET_HANDLE_MAXSIZE,
+                   "UCT listen handle is too big");
 
-    NCCLCHECK(ncclSocketInit(&comm->sock, &context.if_addr,
+    NCCLCHECK(ncclSocketInit(&l_comm->sock, &context.if_addr,
                              NCCL_UCT_LISTEN_HANDLE_MAGIC,
                              ncclSocketTypeNetIb, NULL, 1));
-    NCCLCHECK(ncclSocketListen(&comm->sock));
-    NCCLCHECK(ncclSocketGetAddr(&comm->sock, &addr));
+    NCCLCHECK(ncclSocketListen(&l_comm->sock));
+    NCCLCHECK(ncclSocketGetAddr(&l_comm->sock, &addr));
 
-    comm->uct_worker = nccl_uct_worker_get(&context, dev);
-    if (comm->uct_worker == NULL) {
+    l_comm->uct_worker = nccl_uct_worker_get(&context, dev);
+    if (l_comm->uct_worker == NULL) {
         WARN("Failed to create worker for listener dev=%d", dev);
         return ncclSystemError;
     }
 
     NCCLCHECK(ncclIbMalloc((void **)&accept_comm, sizeof(*accept_comm)));
 
-    comm->comm       = accept_comm;
-    comm->context    = &context;
-    comm->dev        = dev;
-    comm->id         = context.listener_count++;
+    l_comm->comm       = accept_comm;
+    l_comm->context    = &context;
+    l_comm->dev        = dev;
+    l_comm->id         = context.listener_count++;
 
-    *listen_comm = comm;
+    *listen_comm = l_comm;
 
     memset(handle, 0, sizeof(*handle));
     handle->magic         = NCCL_UCT_LISTEN_HANDLE_MAGIC;
-    handle->listener.id   = comm->id;
+    handle->listener.id   = l_comm->id;
     handle->listener.addr = addr;
     handle->comm          = accept_comm;
 
-    WARN("Listen dev=%d ok", dev);
+    WARN("Listening id=%d dev=%d comm=%p", l_comm->id, dev, handle->comm);
     return ncclSuccess;
 }
 

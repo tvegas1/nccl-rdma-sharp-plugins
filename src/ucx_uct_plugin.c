@@ -536,20 +536,20 @@ static uint64_t nccl_uct_am_take_magic(void **data, size_t *length)
     return magic;
 }
 
+/* On receiver side, after ->irecv(), expect corresponding ATP */
 static ucs_status_t nccl_uct_atp_callback(void *arg, void *data, size_t length,
                                           unsigned flags)
 {
-    uint64_t magic        = nccl_uct_am_take_magic(&data, &length);
-    nccl_uct_atp_t *atp = data;
+    nccl_uct_atp_t *atp = (nccl_uct_atp_t *)((uint8_t *)data + 8);
 
-    (void)magic;
+    assert(length == (sizeof(*atp) + 8));
+    assert(*(nccl_uct_comm_t **)data == atp->rdesc->comm);
     assert(atp->id == atp->rdesc->desc.id);
     assert(atp->count == atp->rdesc->desc.count);
-
     assert(atp->rdesc->completion.count == 1);
+
     atp->rdesc->completion.count--;
     memcpy(atp->rdesc->sizes, atp->sizes, atp->count * sizeof(*atp->sizes));
-
     return UCS_OK;
 }
 
@@ -934,7 +934,7 @@ static ncclResult_t nccl_uct_listen(int dev, void *listen_handle,
     handle->magic         = NCCL_UCT_LISTEN_HANDLE_MAGIC;
     handle->listener.id   = comm->id;
     handle->listener.addr = addr;
-    handle->comm          = comm->comm;
+    handle->comm          = accept_comm;
 
     WARN("Listen dev=%d ok", dev);
     return ncclSuccess;

@@ -443,6 +443,40 @@ static void nccl_uct_completion_init(uct_completion_t *completion, int count)
     completion->status = UCS_OK;
 }
 
+static void nccl_uct_comm_rdesc_insert(nccl_uct_rdesc_t *rdesc)
+{
+    nccl_uct_comm_t *comm = rdesc->comm;
+
+    if (comm->rdesc_list.tail != NULL) {
+        rdesc->prev = comm->rdesc_list.tail;
+        comm->rdesc_list.tail->next = rdesc;
+    } else {
+        assert(comm->rdesc_list.head == NULL);
+        rdesc->prev = NULL;
+        comm->rdesc_list.head = rdesc;
+    }
+
+    comm->rdesc_list.tail = rdesc;
+}
+
+static void nccl_uct_comm_rdesc_del(nccl_uct_rdesc_t *rdesc)
+{
+    nccl_uct_comm_t *comm = rdesc->comm;
+
+    if (rdesc->prev != NULL) {
+        rdesc->prev->next = rdesc->next;
+    }
+    if (rdesc->next != NULL) {
+        rdesc->next->prev = rdesc->prev;
+    }
+    if (rdesc == comm->rdesc_list.head) {
+        comm->rdesc_list.head = rdesc->next;
+    }
+    if (rdesc == comm->rdesc_list.tail) {
+        comm->rdesc_list.tail = rdesc->prev;
+    }
+}
+
 static nccl_uct_rdesc_t *
 nccl_uct_comm_rdesc_get(nccl_uct_comm_t *comm)
 {
@@ -457,18 +491,6 @@ nccl_uct_comm_rdesc_get(nccl_uct_comm_t *comm)
     rdesc->next     = NULL;
     rdesc->send_atp = 0;
     rdesc->comm     = comm;
-
-    if (comm->rdesc_list.tail != NULL) {
-        rdesc->prev = comm->rdesc_list.tail;
-        comm->rdesc_list.tail->next = rdesc;
-    } else {
-        assert(comm->rdesc_list.head == NULL);
-        rdesc->prev = NULL;
-        comm->rdesc_list.head = rdesc;
-    }
-
-    comm->rdesc_list.tail = rdesc;
-
     return rdesc;
 }
 
@@ -518,24 +540,6 @@ static nccl_uct_req_t *nccl_uct_rdesc_get_req(nccl_uct_rdesc_t *rdesc, int i,
     return &rdesc->reqs[i];
 }
 
-static void nccl_uct_comm_rdesc_del(nccl_uct_rdesc_t *rdesc)
-{
-    nccl_uct_comm_t *comm = rdesc->comm;
-
-    if (rdesc->prev != NULL) {
-        rdesc->prev->next = rdesc->next;
-    }
-    if (rdesc->next != NULL) {
-        rdesc->next->prev = rdesc->prev;
-    }
-    if (rdesc == comm->rdesc_list.head) {
-        comm->rdesc_list.head = rdesc->next;
-    }
-    if (rdesc == comm->rdesc_list.tail) {
-        comm->rdesc_list.tail = rdesc->prev;
-    }
-}
-
 static void nccl_uct_comm_rdesc_put(nccl_uct_rdesc_t *rdesc)
 {
     nccl_uct_comm_t *comm = rdesc->comm;
@@ -579,6 +583,8 @@ static ucs_status_t nccl_uct_rtr_callback(void *arg, void *data, size_t length,
         WARN("Failed to get an rdesc in RTR callback");
         return UCS_ERR_NO_MEMORY; /* Cannot happend */
     }
+
+    nccl_uct_comm_rdesc_insert(rdesc);
 
     assert((size + 8) == length);
     assert(size == nccl_uct_rdesc_size(desc->count));
@@ -638,6 +644,7 @@ static nccl_uct_iface_t *nccl_uct_iface_open(nccl_uct_worker_t *uct_worker,
     uct_iface_attr_t iface_attr;
     uct_md_h md;
     uct_md_attr_t md_attr;
+    int rtr_size;
 
     status = uct_query_components(&comps, &comps_count);
     if (status != UCS_OK) {
@@ -711,6 +718,13 @@ found:
 
     if (iface_attr.cap.flags & UCT_IFACE_FLAG_AM_SHORT) {
         uct_iface->am_max_short = iface_attr.cap.am.max_short;
+    }
+
+    rtr_size = nccl_uct_rdesc_size(NCCL_UCX_UCT_MAX_RECVS);
+    if (rtr_size > uct_iface->am_max_short) {
+        WARN("Failed RTR does not fit in face AM short (%dB > %dB)",
+             rtr_size, uct_iface->am_max_short);
+        goto fail;
     }
 
     if (uct_iface->rkey_packed_size > sizeof(((nccl_uct_chunk_t *)0)->rkey)) {
@@ -1331,27 +1345,22 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
                                    void **request)
 {
     nccl_uct_comm_t *comm      = recv_comm;
-    nccl_uct_ep_t *uct_ep      = comm->uct_ep;
     nccl_uct_memh_t **uct_memh = (nccl_uct_memh_t **)mhandles;
-    size_t length              = nccl_uct_rdesc_size(n);
     nccl_uct_rdesc_t *rdesc;
-    uint64_t id;
     ucs_status_t status;
 
     assert(n <= NCCL_UCX_UCT_MAX_RECVS);
-    assert(length <= comm->uct_iface->am_max_short);
 
     rdesc = nccl_uct_comm_rdesc_get(comm);
     if (rdesc == NULL) {
         return ncclInternalError;
     }
-    nccl_uct_comm_rdesc_del(rdesc);
 
-    id = comm->rdesc_id++;
-    nccl_uct_rdesc_set(rdesc, id, n, data, sizes, tags, uct_memh);
+    nccl_uct_rdesc_set(rdesc, comm->rdesc_id++, n, data, sizes, tags, uct_memh);
 
-    status = uct_ep_am_short(uct_ep->ep, NCCL_UCT_AM_RTR, (uint64_t)comm->remote_comm,
-                             &rdesc->desc, length);
+    status = uct_ep_am_short(comm->uct_ep->ep, NCCL_UCT_AM_RTR,
+                             (uint64_t)comm->remote_comm, &rdesc->desc,
+                             nccl_uct_rdesc_size(n));
     if (status != UCS_OK) {
         nccl_uct_comm_rdesc_put(rdesc);
         *request = NULL;

@@ -418,6 +418,20 @@ static nccl_uct_ep_t *nccl_uct_ep_create(nccl_uct_iface_t *uct_iface)
     return uct_ep;
 }
 
+static ncclResult_t nccl_uct_ep_connect_to_ep(nccl_uct_ep_t *uct_ep,
+                                              nccl_uct_ep_addr_t *addr)
+{
+    ucs_status_t status = uct_ep_connect_to_ep(uct_ep->ep,
+                                               nccl_uct_ep_addr_dev(addr),
+                                               nccl_uct_ep_addr_ep(addr));
+    if (status != UCS_OK) {
+        WARN("Failed to connect to EP: error %d", status);
+        return ncclSystemError;
+    }
+
+    return ncclSuccess;
+}
+
 static nccl_uct_rdesc_t *
 nccl_uct_comm_rdesc_get(nccl_uct_comm_t *comm)
 {
@@ -912,32 +926,16 @@ static ncclResult_t nccl_uct_comm_init(nccl_uct_comm_t *comm,
                                        nccl_uct_context_t *context,
                                        int dev)
 {
-    comm->dev        = dev;
-    comm->context    = context;
     comm->uct_worker = nccl_uct_worker_get(context, dev);
     if (comm->uct_worker == NULL) {
         return ncclSystemError;
     }
 
-    comm->uct_iface = comm->uct_worker->uct_iface;
-
-
-    comm->uct_ep = nccl_uct_ep_create(comm->uct_iface);
+    comm->dev        = dev;
+    comm->context    = context;
+    comm->uct_iface  = comm->uct_worker->uct_iface;
+    comm->uct_ep     = nccl_uct_ep_create(comm->uct_iface);
     if (comm->uct_ep == NULL) {
-        return ncclSystemError;
-    }
-
-    return ncclSuccess;
-}
-
-static ncclResult_t nccl_uct_ep_connect_to_ep(nccl_uct_ep_t *uct_ep,
-                                              nccl_uct_ep_addr_t *addr)
-{
-    ucs_status_t status = uct_ep_connect_to_ep(uct_ep->ep,
-                                               nccl_uct_ep_addr_dev(addr),
-                                               nccl_uct_ep_addr_ep(addr));
-    if (status != UCS_OK) {
-        WARN("Failed to connect to EP: error %d", status);
         return ncclSystemError;
     }
 

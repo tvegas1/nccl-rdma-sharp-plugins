@@ -167,7 +167,7 @@ typedef struct nccl_uct_comm {
         nccl_uct_ep_t       *uct_ep;    /* Locally read from HCA */
         nccl_uct_ep_addr_t  addr;
 
-        uint8_t             mem[512]; /* TODO shrink */
+        uint8_t             mem[65];    /* Dummy memory to read into */
         uct_mem_h           memh;
     } gpu_flush;
 
@@ -493,7 +493,6 @@ nccl_uct_comm_rdesc_get(nccl_uct_comm_t *comm)
     }
 
     rdesc->next     = NULL;
-    rdesc->send_atp = 0;
     rdesc->comm     = comm;
     return rdesc;
 }
@@ -1403,10 +1402,10 @@ static ncclResult_t nccl_uct_iflush(void *recv_comm, int n, void **data,
         return ncclInternalError;
     }
 
-    nccl_uct_rdesc_set(rdesc, ~0, 0, NULL, NULL, NULL, &uct_memh[last]); /* TODO: cleanup */
+    nccl_uct_rdesc_set(rdesc, ~0, 0, NULL, NULL, NULL, NULL);
 
     iov.buffer  = comm->gpu_flush.mem;
-    iov.length  = 65;
+    iov.length  = sizeof(comm->gpu_flush.mem);
     iov.memh    = comm->gpu_flush.memh;
     iov.stride  = iov.length;
     iov.count   = 1;
@@ -1437,6 +1436,7 @@ static ncclResult_t nccl_uct_test(void *request, int *done, int *sizes)
     uct_worker_progress(comm->uct_worker->worker);
 
     if (rdesc->send_atp == 1) {
+        /* unlikely */
         nccl_uct_send_atp(comm, rdesc);
     }
 
@@ -1446,7 +1446,6 @@ static ncclResult_t nccl_uct_test(void *request, int *done, int *sizes)
     }
 
     assert(rdesc->send_atp == 0);
-    assert(rdesc->completion.count == 0);
     *done = 1;
 
     if (req->size == NCCL_UCT_REQ_IRECV) {

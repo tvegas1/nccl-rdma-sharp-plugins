@@ -155,7 +155,7 @@ typedef struct nccl_uct_comm {
     nccl_uct_rdesc_t        *free_rdesc;  /* Available rdesc for reuse */
     uint64_t                rdesc_id;     /* Next sequence number to use */
 
-    struct nccl_uct_comm    *remote_comm; /* Cookie received while connecting */
+    const struct nccl_uct_comm *remote_comm; /* Cookie received while connecting */
 
     /* Local GET on current device */
     struct {
@@ -924,17 +924,19 @@ static ncclResult_t nccl_uct_close_listen(void *listen_comm)
 
 static ncclResult_t nccl_uct_comm_init(nccl_uct_comm_t *comm,
                                        nccl_uct_context_t *context,
-                                       int dev)
+                                       int dev,
+                                       const nccl_uct_comm_t *remote_comm)
 {
     comm->uct_worker = nccl_uct_worker_get(context, dev);
     if (comm->uct_worker == NULL) {
         return ncclSystemError;
     }
 
-    comm->dev        = dev;
-    comm->context    = context;
-    comm->uct_iface  = comm->uct_worker->uct_iface;
-    comm->uct_ep     = nccl_uct_ep_create(comm->uct_iface);
+    comm->dev         = dev;
+    comm->context     = context;
+    comm->remote_comm = remote_comm;
+    comm->uct_iface   = comm->uct_worker->uct_iface;
+    comm->uct_ep      = nccl_uct_ep_create(comm->uct_iface);
     if (comm->uct_ep == NULL) {
         return ncclSystemError;
     }
@@ -946,27 +948,26 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
                                      void **send_comm,
                                      ncclNetDeviceHandle_t** sendDevComm)
 {
+    int ready                        = 1;
     nccl_uct_listen_handle_t *handle = listen_handle;
     nccl_uct_stage_t *stage          = &handle->stage;
     nccl_uct_comm_t *comm            = stage->comm;
     nccl_uct_comm_addr_t addr;
-    int ready;
 
     *send_comm = NULL;
 
     switch (stage->state) {
     case NCCL_UCT_START:
         NCCLCHECK(ncclIbMalloc((void **)&comm, sizeof(*comm)));
+        NCCLCHECK(nccl_uct_comm_init(comm, &context, dev, handle->comm));
         NCCLCHECK(ncclSocketInit(&comm->sock, &handle->listener.addr,
                                  handle->magic, ncclSocketTypeNetIb, NULL, 1));
         NCCLCHECK(ncclSocketConnect(&comm->sock));
 
-        comm->remote_comm = handle->comm;
-        NCCLCHECK(nccl_uct_comm_init(comm, &context, dev));
-
         stage->comm  = comm;
         stage->state = NCCL_UCT_CONNECT;
         /* fallthrough */
+
     case NCCL_UCT_CONNECT:
         NCCLCHECK(ncclSocketReady(&comm->sock, &ready));
         if (!ready) {
@@ -974,29 +975,28 @@ static ncclResult_t nccl_uct_connect(int dev, void *listen_handle,
         }
 
         NCCLCHECK(nccl_uct_ep_addr_set(&addr.rma, comm, comm->uct_ep));
-        stage->state = NCCL_UCT_RECEIVE_ADDR;
-        /* TODO: Add EP addresses for multiple QPs */
         NCCLCHECK(ncclSocketSend(&comm->sock, &addr, sizeof(addr)));
         NCCLCHECK(ncclSocketSend(&comm->sock, &comm, sizeof(comm)));
 
-        WARN("connect for dev=%d w=%p i=%p ep=%p",
-             dev, comm->uct_worker, comm->uct_iface, comm->uct_ep);
+        stage->offset = 0;
+        stage->state  = NCCL_UCT_RECEIVE_ADDR;
         /* fallthrough */
+
     case NCCL_UCT_RECEIVE_ADDR:
-        /* TODO: Merge connect and accept codes */
         NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, &comm->sock,
                                      &comm->addr, sizeof(comm->addr),
                                      &stage->offset));
         if (stage->offset != sizeof(comm->addr)) {
-            return ncclSuccess;
+            return ncclSuccess; /* In progress */
         }
 
         NCCLCHECK(nccl_uct_ep_connect_to_ep(comm->uct_ep, &comm->addr.rma));
-        WARN("connect rx'd");
-        stage->state = NCCL_UCT_DONE;
-        *send_comm = comm;
-        ready = 1;
         NCCLCHECK(ncclSocketSend(&comm->sock, &ready, sizeof(ready)));
+
+        *send_comm = comm;
+        stage->state = NCCL_UCT_DONE;
+        WARN("Connected comm=%p remote_comm=%p listener_id=%d",
+             comm, comm->remote_comm, handle->listener.id);
         break;
 
     default:

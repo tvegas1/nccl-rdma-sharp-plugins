@@ -878,11 +878,11 @@ static nccl_uct_worker_t *nccl_uct_worker_get(nccl_uct_context_t *context,
         goto out;
     }
 
-found:
-    w->count++;
     w->next              = context->worker_list;
     context->worker_list = w;
 
+found:
+    w->count++;
 out:
     pthread_mutex_unlock(&nccl_uct_lock);
     return w;

@@ -431,6 +431,18 @@ static ncclResult_t nccl_uct_ep_connect_to_ep(nccl_uct_ep_t *uct_ep,
     return ncclSuccess;
 }
 
+static void nccl_uct_completion_callback(uct_completion_t *comp)
+{
+    assert(comp->count == 0);
+}
+
+static void nccl_uct_completion_init(uct_completion_t *completion, int count)
+{
+    completion->func   = nccl_uct_completion_callback;
+    completion->count  = count;
+    completion->status = UCS_OK;
+}
+
 static nccl_uct_rdesc_t *
 nccl_uct_comm_rdesc_get(nccl_uct_comm_t *comm)
 {
@@ -458,6 +470,52 @@ nccl_uct_comm_rdesc_get(nccl_uct_comm_t *comm)
     comm->rdesc_list.tail = rdesc;
 
     return rdesc;
+}
+
+static size_t nccl_uct_rdesc_size(int n)
+{
+    return n * sizeof(nccl_uct_chunk_t) + sizeof(nccl_uct_rdesc_hdr_t);
+}
+
+/* Prepare a receive descriptor from irecv()/iflush() side */
+static void nccl_uct_rdesc_set(nccl_uct_rdesc_t *rdesc,
+                               uint64_t id, int n, void **data,
+                               int *sizes, int *tags,
+                               nccl_uct_memh_t **uct_memh)
+{
+    nccl_uct_rdesc_hdr_t *desc = &rdesc->desc;
+    int i;
+
+    /* Populate header */
+    desc->id         = id;
+    desc->count      = n;
+    desc->size       = nccl_uct_rdesc_size(n);
+    desc->peer_rdesc = rdesc; /* cookie, will be returned in ATP */
+
+    /* Ref count that prevents NCCL from releasing memory */
+    rdesc->nccl_usage = 1;
+    rdesc->send_atp   = 0;
+    nccl_uct_completion_init(&rdesc->completion, 1); /* wait for ATP or Flush */
+
+    /* Zero (iflush) or One or many receive request are contained */
+    for (i = 0; i < n; i++) {
+        desc->chunk[i].tag  = tags[i];
+        desc->chunk[i].size = sizes[i];
+        desc->chunk[i].data = data[i];
+        desc->chunk[i].done = 0;
+
+        desc->chunk[i].rkey = uct_memh[i]->bundle.rkey;
+    }
+}
+
+static nccl_uct_req_t *nccl_uct_rdesc_get_req(nccl_uct_rdesc_t *rdesc, int i,
+                                              int size)
+{
+    assert(i < NCCL_UCX_UCT_MAX_RECVS);
+
+    rdesc->reqs[i].size  = size;
+    rdesc->reqs[i].rdesc = rdesc;
+    return &rdesc->reqs[i];
 }
 
 static void nccl_uct_comm_rdesc_del(nccl_uct_rdesc_t *rdesc)
@@ -488,54 +546,6 @@ static void nccl_uct_comm_rdesc_put(nccl_uct_rdesc_t *rdesc)
     rdesc->comm      = NULL;
     rdesc->next      = comm->free_rdesc;
     comm->free_rdesc = rdesc;
-}
-
-static size_t nccl_uct_rdesc_size(int n)
-{
-    return n * sizeof(nccl_uct_chunk_t) + sizeof(nccl_uct_rdesc_hdr_t);
-}
-
-static void nccl_uct_completion_callback(uct_completion_t *comp)
-{
-    assert(comp->count == 0);
-}
-
-static void nccl_uct_completion_init(uct_completion_t *completion, int count)
-{
-    completion->func   = nccl_uct_completion_callback;
-    completion->count  = count;
-    completion->status = UCS_OK;
-}
-
-/* Prepare a receive descriptor from irecv()/iflush() side */
-static void nccl_uct_recv_desc_set(nccl_uct_rdesc_t *rdesc,
-                                   uint64_t id, int n, void **data,
-                                   int *sizes, int *tags,
-                                   nccl_uct_memh_t **uct_memh)
-{
-    nccl_uct_rdesc_hdr_t *desc = &rdesc->desc;
-    int i;
-
-    /* Populate header */
-    desc->id         = id;
-    desc->count      = n;
-    desc->size       = nccl_uct_rdesc_size(n);
-    desc->peer_rdesc = rdesc; /* cookie, will be returned in ATP */
-
-    /* Ref count that prevents NCCL from releasing memory */
-    rdesc->nccl_usage = 1;
-    rdesc->send_atp   = 0;
-    nccl_uct_completion_init(&rdesc->completion, 1); /* wait for ATP or Flush */
-
-    /* Zero (iflush) or One or many receive request are contained */
-    for (i = 0; i < n; i++) {
-        desc->chunk[i].tag  = tags[i];
-        desc->chunk[i].size = sizes[i];
-        desc->chunk[i].data = data[i];
-        desc->chunk[i].done = 0;
-
-        desc->chunk[i].rkey = uct_memh[i]->bundle.rkey;
-    }
 }
 
 /* On receiver side, after ->irecv(), expect corresponding ATP */
@@ -607,7 +617,6 @@ static ncclResult_t nccl_uct_iface_set_rtr_mode(nccl_uct_iface_t *uct_iface,
 
 static void nccl_uct_iface_close(nccl_uct_iface_t *uct_iface)
 {
-
     uct_iface_close(uct_iface->iface);
     uct_md_close(uct_iface->md);
     free(uct_iface->dev_addr);
@@ -1172,7 +1181,7 @@ static ncclResult_t nccl_uct_reg_mr(void *reg_comm, void *data, size_t size,
         return ncclSystemError;
     }
 
-    /* Get remote key */
+    /* Unpack rkey from sender side */
     status = uct_rkey_unpack(comp, uct_memh->rkey,
                              &uct_memh->bundle);
     if (status != UCS_OK) {
@@ -1180,7 +1189,6 @@ static ncclResult_t nccl_uct_reg_mr(void *reg_comm, void *data, size_t size,
         return ncclInternalError;
     }
 
-//    WARN("REGED memh %p %p/%zu rkey %x\n", uct_memh, addr, size, uct_memh->bundle.rkey);
     *mhandle = uct_memh;
     return ncclSuccess;
 }
@@ -1190,7 +1198,6 @@ static ncclResult_t nccl_uct_reg_mr_dmabuf(void *reg_comm, void *data,
                                            uint64_t offset, int fd,
                                            void **mhandle)
 {
-    /* TODO: Use mem reg v2 with DMABUF flag? */
     return nccl_uct_reg_mr(reg_comm, data, size, type, mhandle);
 }
 
@@ -1204,6 +1211,11 @@ static ncclResult_t nccl_uct_dereg_mr(void *dereg_comm, void *mhandle)
     assert(uct_memh->memh != UCT_MEM_HANDLE_NULL);
     assert(uct_memh->comm == comm);
 
+    status = uct_rkey_release(comp, &uct_memh->bundle);
+    if (status != UCS_OK) {
+        WARN("Failed to release rkey bundle: error %d", status);
+    }
+
     status = uct_md_mem_dereg(comm->uct_iface->md, uct_memh->memh);
     if (status != UCS_OK) {
         WARN("Failed to deregister memh %p on comm %p: error %d",
@@ -1211,23 +1223,9 @@ static ncclResult_t nccl_uct_dereg_mr(void *dereg_comm, void *mhandle)
         return ncclSystemError;
     }
 
-    status = uct_rkey_release(comp, &uct_memh->bundle);
-    if (status != UCS_OK) {
-        WARN("Failed to release rkey bundle: error %d", status);
-    }
-
+    uct_memh->comm = NULL;
     free(uct_memh);
     return ncclSuccess;
-}
-
-static nccl_uct_req_t *nccl_uct_rdesc_get_req(nccl_uct_rdesc_t *rdesc, int i,
-                                              int size)
-{
-    assert(i < NCCL_UCX_UCT_MAX_RECVS);
-
-    rdesc->reqs[i].size  = size;
-    rdesc->reqs[i].rdesc = rdesc;
-    return &rdesc->reqs[i];
 }
 
 static ucs_status_t nccl_uct_send_atp(nccl_uct_comm_t *comm,
@@ -1364,7 +1362,7 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
     nccl_uct_comm_rdesc_del(rdesc);
 
     id = comm->rdesc_id++;
-    nccl_uct_recv_desc_set(rdesc, id, n, data, sizes, tags, uct_memh);
+    nccl_uct_rdesc_set(rdesc, id, n, data, sizes, tags, uct_memh);
 
     status = uct_ep_am_short(uct_ep->ep, NCCL_UCT_AM_RTR, (uint64_t)comm->remote_comm,
                              &rdesc->desc, length);
@@ -1426,7 +1424,7 @@ static ncclResult_t nccl_uct_iflush(void *recv_comm, int n, void **data,
     rdesc->start = gettime();
 
     nccl_uct_comm_rdesc_del(rdesc);
-    nccl_uct_recv_desc_set(rdesc, ~0, 0, NULL, NULL, NULL, &uct_memh[last]); /* TODO: cleanup */
+    nccl_uct_rdesc_set(rdesc, ~0, 0, NULL, NULL, NULL, &uct_memh[last]); /* TODO: cleanup */
 
     iov.buffer  = comm->gpu_flush.mem;
     iov.length  = 65;
@@ -1550,7 +1548,7 @@ ncclNet_v8_t ucxUctPlugin_v8 = {
     .connect       = nccl_uct_connect,
     .accept        = nccl_uct_accept,
     .regMr         = nccl_uct_reg_mr,
-    .regMrDmaBuf   = nccl_uct_reg_mr_dmabuf,
+    .regMrDmaBuf   = nccl_uct_reg_mr_dmabuf, /* TODO: Test perf when fd != -1 */
     .deregMr       = nccl_uct_dereg_mr,
     .isend         = nccl_uct_isend,
     .irecv         = nccl_uct_irecv,

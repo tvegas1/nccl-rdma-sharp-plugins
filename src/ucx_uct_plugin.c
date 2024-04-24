@@ -169,7 +169,7 @@ typedef struct nccl_uct_comm {
         nccl_uct_ep_t       *uct_ep;    /* Locally read from HCA */
         nccl_uct_ep_addr_t  addr;
 
-        uint8_t             mem[1];    /* Dummy memory to read into */
+        uint8_t             mem[65];    /* Dummy memory to read into */
         uct_mem_h           memh;
     } gpu_flush;
 
@@ -1429,7 +1429,7 @@ static ncclResult_t nccl_uct_iflush(void *recv_comm, int n, void **data,
     } else if (status == UCS_INPROGRESS) {
         *request = req;
     } else {
-        WARN("Failed to flush local ep comm=%p", comm);
+        WARN("Failed to flush local ep comm=%p status=%d", comm, status);
         return ncclInternalError;
     }
 

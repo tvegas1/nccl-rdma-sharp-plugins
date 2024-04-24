@@ -169,7 +169,6 @@ struct ucx_comm;
 typedef struct ucx_request {
   struct ucx_request *next;    /* Next request in the free list */
   struct ucx_comm    *comm;    /* Owning communicator */
-  double              start;
   ucp_worker_h        worker;  /* Worker for all requests */
   int                 pending; /* How many requests are still pending */
   int                 count;   /* How many requests are contained */
@@ -683,7 +682,6 @@ static ucx_request_t *ucx_request_get(ucx_comm_t *comm) {
   req->worker  = comm->ucx_worker->worker;
   req->pending = 0;
   req->count   = 0;
-  req->start   = 0;
   return req;
 }
 
@@ -826,7 +824,6 @@ static ucp_tag_t nccl_ucx_ucp_tag(ucp_tag_t comm_tag, uint64_t tag)
   return comm_tag + (tag << 32);
 }
 
-int send_count = 0;
 static ncclResult_t nccl_ucx_isend(void *send_comm, void *data, int size,
                                    int tag, void *mhandle, void **request)
 {
@@ -871,7 +868,6 @@ static ncclResult_t nccl_ucx_isend(void *send_comm, void *data, int size,
     req->pending--;
   }
 
-  send_count++;
   *request = req;
   return ncclSuccess;
 }
@@ -935,21 +931,6 @@ static ncclResult_t nccl_ucx_irecv(void *recv_comm, int n, void **data,
   return ncclSuccess;
 }
 
-#include <time.h>
-#include <stdio.h>
-
-static double total_flush = 0;
-static int flush_start = 0;
-static int flush_end = 0;
-
-static double gettime(void)
-{
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  return (double)tv.tv_sec * 1000 * 1000 + (double)tv.tv_usec;
-}
-
-
 ncclResult_t nccl_ucx_iflush(void *recv_comm, int n, void **data, int *sizes,
                              void **mhandle, void **request) {
   int last            = -1;
@@ -969,8 +950,6 @@ ncclResult_t nccl_ucx_iflush(void *recv_comm, int n, void **data, int *sizes,
     return ncclInternalError;
   }
 
-  flush_start++;
-  req->start = gettime();
   ucx_request_add(req, size);
 
   params.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
@@ -1003,10 +982,6 @@ static ncclResult_t nccl_ucx_test(void *request, int *done, int *size) {
     }
   }
 
-  if (req->start > 0.)  {
-      total_flush += gettime() - req->start;
-      flush_end++;
-  }
   *done = 1;
   if (size != NULL) {
     /* Posted receives have completed */
@@ -1052,8 +1027,6 @@ ncclResult_t nccl_ucx_close_send(void *send_comm) {
 ncclResult_t nccl_ucx_close_recv(void *recv_comm) {
   ucx_comm_t *comm = (ucx_comm_t*)recv_comm;
   void *close_req;
-  printf("VEG flush %d/%d totalflush %lf duration %lf send_count=%d\n",
-         flush_start, flush_end, total_flush, total_flush/flush_start, send_count);
 
   if (comm) {
     if (comm->gpuFlush.enabled) {

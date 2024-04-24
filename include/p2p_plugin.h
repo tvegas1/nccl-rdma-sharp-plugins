@@ -61,7 +61,6 @@ struct ncclIbRequest {
   int events[NCCL_IB_MAX_DEVS_PER_NIC];
   struct ncclIbNetCommDevBase* devBases[NCCL_IB_MAX_DEVS_PER_NIC];
   int nreqs;
-  double start;
   union {
     struct {
       int size;

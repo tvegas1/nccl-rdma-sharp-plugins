@@ -506,7 +506,7 @@ static void nccl_uct_empty_callback(uct_completion_t *comp) {
 }
 
 static nccl_uct_req_t *nccl_uct_rdesc_get_req(nccl_uct_rdesc_t *rdesc, int i,
-                                              int size, int count) {
+                                              int size) {
   nccl_uct_req_t *req;
 
   assert(i < NCCL_UCX_UCT_MAX_RECVS);
@@ -577,12 +577,11 @@ static ucs_status_t nccl_uct_rtr_callback(void *arg, void *data, size_t length,
 
 static ncclResult_t nccl_uct_iface_set_handler(nccl_uct_iface_t *uct_iface,
                                                int id,
-                                               uct_am_callback_t callback,
-                                               nccl_uct_comm_t *comm) {
+                                               uct_am_callback_t callback) {
   ucs_status_t status =
-      uct_iface_set_am_handler(uct_iface->iface, id, callback, comm, 0);
+      uct_iface_set_am_handler(uct_iface->iface, id, callback, NULL, 0);
   if (status != UCS_OK) {
-    WARN("Failed to get AM handler id=%d comm=%p", id, comm, status);
+    WARN("Failed to get AM handler id=%d status=%d", id, status);
     return ncclInternalError;
   }
 
@@ -592,9 +591,9 @@ static ncclResult_t nccl_uct_iface_set_handler(nccl_uct_iface_t *uct_iface,
 static ncclResult_t nccl_uct_iface_set_rtr_mode(nccl_uct_iface_t *uct_iface,
                                                 nccl_uct_comm_t *comm) {
   NCCLCHECK(nccl_uct_iface_set_handler(uct_iface, NCCL_UCT_AM_RTR,
-                                       nccl_uct_rtr_callback, NULL));
+                                       nccl_uct_rtr_callback));
   NCCLCHECK(nccl_uct_iface_set_handler(uct_iface, NCCL_UCT_AM_ATP,
-                                       nccl_uct_atp_callback, NULL));
+                                       nccl_uct_atp_callback));
   return ncclSuccess;
 }
 
@@ -1240,7 +1239,7 @@ static ncclResult_t nccl_uct_send(nccl_uct_comm_t *comm, void *data, int size,
 
   assert(size <= rdesc->desc.chunk[i].size);
 
-  req = nccl_uct_rdesc_get_req(rdesc, i, size, 1); /* NCCL request */
+  req = nccl_uct_rdesc_get_req(rdesc, i, size); /* NCCL request */
 
   status = uct_ep_put_zcopy(comm->uct_ep->ep, &iov, 1,
                             (uint64_t)rdesc->desc.chunk[i].data,
@@ -1312,7 +1311,7 @@ static ncclResult_t nccl_uct_irecv(void *recv_comm, int n, void **data,
     *request = NULL;
   } else {
     /* Wait for receiving ATP */
-    *request = nccl_uct_rdesc_get_req(rdesc, 0, NCCL_UCT_REQ_IRECV, 1);
+    *request = nccl_uct_rdesc_get_req(rdesc, 0, NCCL_UCT_REQ_IRECV);
   }
 
   return ncclSuccess;
@@ -1349,7 +1348,7 @@ static ncclResult_t nccl_uct_iflush(void *recv_comm, int n, void **data,
 
   nccl_uct_rdesc_set(rdesc, ~0, 0, NULL, NULL, NULL, NULL);
   /* Wait for local GET completion */
-  req = nccl_uct_rdesc_get_req(rdesc, 0, NCCL_UCT_REQ_IFLUSH, 1);
+  req = nccl_uct_rdesc_get_req(rdesc, 0, NCCL_UCT_REQ_IFLUSH);
 
   iov.buffer = comm->gpu_flush.mem;
   iov.length = sizeof(comm->gpu_flush.mem);

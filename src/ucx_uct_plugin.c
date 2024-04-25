@@ -1469,6 +1469,66 @@ static ncclResult_t nccl_uct_close(void *close_comm) {
   return ncclSuccess;
 }
 
+ncclResult_t nccl_uct_get_properties_v7(int dev,
+                                        ncclNetProperties_v7_t *props_v7) {
+  ncclNetProperties_t props;
+  ncclResult_t ret = nccl_uct_get_properties(dev, &props);
+  if (ret != ncclSuccess) {
+    return ret;
+  }
+
+  props_v7->name             = props.name;
+  props_v7->pciPath          = props.pciPath;
+  props_v7->guid             = props.guid;
+  props_v7->ptrSupport       = props.ptrSupport;
+  props_v7->speed            = props.speed;
+  props_v7->latency          = props.latency;
+  props_v7->port             = props.port;
+  props_v7->maxComms         = props.maxComms;
+  props_v7->maxRecvs         = props.maxRecvs;
+  props_v7->netDeviceType    = props.netDeviceType;
+  props_v7->netDeviceVersion = props.netDeviceVersion;
+
+  return ncclSuccess;
+}
+
+static ncclResult_t nccl_uct_reg_mr_v7(void *comm, void *data, int size,
+                                       int type, void **mhandle) {
+  return nccl_uct_reg_mr(comm, data, (size_t)size, type, mhandle);
+}
+
+static ncclResult_t
+nccl_uct_get_properties_v6(int dev, ncclNetProperties_v6_t *props_v6) {
+  ncclNetProperties_t props;
+  ncclResult_t ret = nccl_uct_get_properties(dev, &props);
+  if (ret != ncclSuccess) {
+    return ret;
+  }
+
+  props_v6->name       = props.name;
+  props_v6->pciPath    = props.pciPath;
+  props_v6->guid       = props.guid;
+  props_v6->ptrSupport = props.ptrSupport;
+  props_v6->speed      = props.speed;
+  props_v6->latency    = props.latency;
+  props_v6->port       = props.port;
+  props_v6->maxComms   = props.maxComms;
+  props_v6->maxRecvs   = props.maxRecvs;
+
+  return ncclSuccess;
+}
+
+static ncclResult_t nccl_uct_connect_v6(int dev, void *handle,
+                                        void **send_comm) {
+  ncclNetDeviceHandle_v7_t *dev_handle = NULL;
+  return nccl_uct_connect(dev, handle, send_comm, &dev_handle);
+}
+
+static ncclResult_t nccl_uct_accept_v6(void *listen_comm, void **recv_comm) {
+  ncclNetDeviceHandle_v7_t *dev_handle = NULL;
+  return nccl_uct_accept(listen_comm, recv_comm, &dev_handle);
+}
+
 ncclNet_v8_t ucxUctPlugin_v8 = {
   .name          = "UCX-UCT",
   .init          = nccl_uct_init,
@@ -1489,4 +1549,65 @@ ncclNet_v8_t ucxUctPlugin_v8 = {
   .closeListen   = nccl_uct_close_listen,
   .getDeviceMr   = NULL,
   .irecvConsumed = NULL
+};
+
+ncclNet_v7_t ucxUctPlugin_v7 = {
+  .name          = "UCX-UCT",
+  .init          = nccl_uct_init,
+  .devices       = nccl_uct_devices,
+  .getProperties = nccl_uct_get_properties_v7,
+  .listen        = nccl_uct_listen,
+  .connect       = nccl_uct_connect,
+  .accept        = nccl_uct_accept,
+  .regMr         = nccl_uct_reg_mr_v7,
+  .regMrDmaBuf   = nccl_uct_reg_mr_dmabuf,
+  .deregMr       = nccl_uct_dereg_mr,
+  .isend         = nccl_uct_isend,
+  .irecv         = nccl_uct_irecv,
+  .iflush        = nccl_uct_iflush,
+  .test          = nccl_uct_test,
+  .closeSend     = nccl_uct_close,
+  .closeRecv     = nccl_uct_close,
+  .closeListen   = nccl_uct_close_listen,
+  .getDeviceMr   = NULL,
+  .irecvConsumed = NULL
+};
+
+ncclNet_v6_t ucxUctPlugin_v6 = {
+  .name          = "UCX-UCT",
+  .init          = nccl_uct_init,
+  .devices       = nccl_uct_devices,
+  .getProperties = nccl_uct_get_properties_v6,
+  .listen        = nccl_uct_listen,
+  .connect       = nccl_uct_connect_v6,
+  .accept        = nccl_uct_accept_v6,
+  .regMr         = nccl_uct_reg_mr_v7,
+  .regMrDmaBuf   = nccl_uct_reg_mr_dmabuf,
+  .deregMr       = nccl_uct_dereg_mr,
+  .isend         = nccl_uct_isend,
+  .irecv         = nccl_uct_irecv,
+  .iflush        = nccl_uct_iflush,
+  .test          = nccl_uct_test,
+  .closeSend     = nccl_uct_close,
+  .closeRecv     = nccl_uct_close,
+  .closeListen   = nccl_uct_close_listen
+};
+
+ncclNet_v5_t ucxUctPlugin_v5 = {
+  .name          = "UCX-UCT",
+  .init          = nccl_uct_init,
+  .devices       = nccl_uct_devices,
+  .getProperties = nccl_uct_get_properties_v6,
+  .listen        = nccl_uct_listen,
+  .connect       = nccl_uct_connect_v6,
+  .accept        = nccl_uct_accept_v6,
+  .regMr         = nccl_uct_reg_mr_v7,
+  .deregMr       = nccl_uct_dereg_mr,
+  .isend         = nccl_uct_isend,
+  .irecv         = nccl_uct_irecv,
+  .iflush        = nccl_uct_iflush,
+  .test          = nccl_uct_test,
+  .closeSend     = nccl_uct_close,
+  .closeRecv     = nccl_uct_close,
+  .closeListen   = nccl_uct_close_listen
 };

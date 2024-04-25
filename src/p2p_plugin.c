@@ -24,6 +24,9 @@ extern ncclNet_v7_t ucxRmaPlugin_v7;
 extern ncclNet_v6_t ucxRmaPlugin_v6;
 extern ncclNet_v5_t ucxRmaPlugin_v5;
 extern ncclNet_v8_t ucxUctPlugin_v8;
+extern ncclNet_v7_t ucxUctPlugin_v7;
+extern ncclNet_v6_t ucxUctPlugin_v6;
+extern ncclNet_v5_t ucxUctPlugin_v5;
 #endif
 
 extern ncclNet_v8_t ibPlugin_v8;
@@ -110,6 +113,9 @@ static void pluginSetup()
       break;
     case NCCL_P2P_UCX_UCT:
       ncclNetPlugin_v8 = ucxUctPlugin_v8;
+      ncclNetPlugin_v7 = ucxUctPlugin_v7;
+      ncclNetPlugin_v6 = ucxUctPlugin_v6;
+      ncclNetPlugin_v5 = ucxUctPlugin_v5;
       break;
 #endif
     default:

@@ -29,7 +29,8 @@ typedef enum {
 typedef enum {
   NCCL_UCT_AM_RTR = 14, /* Use particular values */
   NCCL_UCT_AM_ATP = 15,
-  NCCL_UCT_AM_RTS = 16
+  NCCL_UCT_AM_RTS = 16,
+  NCCL_UCT_AM_ATS = 17
 } nccl_uct_am_type_t;
 
 typedef enum {
@@ -130,7 +131,7 @@ typedef struct {
     uct_rkey_t      rkey;
     nccl_uct_memh_t *uct_memh;
   } u;
-  void       *opaque;
+  struct nccl_uct_rd_req *opaque;
 } nccl_uct_mem_t;
 
 /*
@@ -262,10 +263,11 @@ static inline unsigned nccl_uct_ring_find(nccl_uct_ring_t *ring, int tag)
 }
 
 typedef struct {
-  uct_iov_t        iov;
-  uint64_t         rva;
-  uct_rkey_t       rkey;
-  uct_completion_t *completion;
+  uct_iov_t              iov;
+  uint64_t               rva;
+  uct_rkey_t             rkey;
+  uct_completion_t       *completion;
+  struct nccl_uct_rd_req *req;
 } nccl_uct_get_param_t;
 
 #define NCCL_UCT_GET_PARAM_SIZE 512
@@ -376,6 +378,11 @@ typedef struct nccl_uct_rd_req {
   uct_completion_t        completion; /* Keep first */
   int                     send_rts;
   int                     count;
+  int                     rts_count; /* RTS received */
+  int                     started;
+  int                     ats_sent;
+
+  struct nccl_uct_rd_req  *remote_req[NCCL_UCX_UCT_MAX_RECVS];
 
   struct nccl_uct_rd_req  *next;
   nccl_uct_comm_t         *comm;
@@ -720,6 +727,28 @@ static ucs_status_t nccl_uct_rtr_callback(void *arg, void *data, size_t length,
   return UCS_OK;
 }
 
+static void nccl_uct_rd_send_ats(nccl_uct_rd_req_t *req)
+{
+  ucs_status_t status;
+
+  assert(req->ats_sent == 0);
+  assert(req->send_rts == 0);
+  assert(req->rts_count == req->count);
+  assert(req->completion.count == 1);
+
+  status = uct_ep_fence(req->comm->uct_ep->ep, 0);
+  assert(status == UCS_OK);
+
+  status = uct_ep_am_short(req->comm->uct_ep->ep, NCCL_UCT_AM_ATS,
+                           (uint64_t)req->comm->remote_comm,
+                           req->remote_req,
+                           sizeof(*req->remote_req) * req->rts_count);
+  if (status == UCS_OK) {
+    req->ats_sent = 1;
+    req->completion.count--;
+  }
+}
+
 static ucs_status_t nccl_uct_get_zcopy(nccl_uct_comm_t *comm,
                                        nccl_uct_get_param_t *param)
 {
@@ -733,6 +762,13 @@ static ucs_status_t nccl_uct_get_zcopy(nccl_uct_comm_t *comm,
     return status;
   }
 
+  param->req->started++;
+  assert(param->req->started <= param->req->count);
+
+  if (param->completion->count == 1) {
+    nccl_uct_rd_send_ats(param->req);
+  }
+
   return UCS_OK;
 }
 
@@ -744,6 +780,7 @@ static void nccl_uct_match_add(nccl_uct_comm_t *comm, nccl_uct_mem_t *src,
   int i;
 
   i     = comm->get.last++;
+  i    &= NCCL_UCT_GET_PARAM_MASK;
   param = &comm->get.param[i];
 
   assert(src->size <= dst->size);
@@ -751,6 +788,9 @@ static void nccl_uct_match_add(nccl_uct_comm_t *comm, nccl_uct_mem_t *src,
          (comm->get.last & NCCL_UCT_GET_PARAM_MASK));
 
   dst->size = src->size;
+
+  req->remote_req[req->rts_count++] = src->opaque;
+  assert(req->rts_count <= NCCL_UCX_UCT_MAX_RECVS);
 
   param->iov.buffer = dst->data;
   param->iov.length = dst->size;
@@ -760,6 +800,7 @@ static void nccl_uct_match_add(nccl_uct_comm_t *comm, nccl_uct_mem_t *src,
   param->rva        = (uint64_t)src->data;
   param->rkey       = src->u.rkey;
   param->completion = &req->completion;
+  param->req        = req;
 }
 
 static inline void nccl_uct_match_drain(nccl_uct_comm_t *comm)
@@ -779,7 +820,6 @@ static inline void nccl_uct_match_drain(nccl_uct_comm_t *comm)
 
 static nccl_uct_rd_req_t *nccl_uct_rd_req_alloc(nccl_uct_comm_t *comm)
 {
-  WARN("alloc COMM %p", comm);
   nccl_uct_rd_req_t *req = comm->free_req;
 
   if (req == NULL) {
@@ -822,9 +862,12 @@ ncclResult_t nccl_uct_rd_irecv(void *recv_comm, int n, void **data,
 
   req->send_rts           = 0;
   req->completion.func    = nccl_uct_empty_callback;
-  req->completion.count   = n;
+  req->completion.count   = n + 1;
   req->completion.status  = UCS_OK;
   req->count              = n;
+  req->rts_count          = 0;
+  req->started            = 0;
+  req->ats_sent           = 0;
 
   assert(n < NCCL_UCX_UCT_MAX_RECVS);
 
@@ -853,6 +896,23 @@ ncclResult_t nccl_uct_rd_irecv(void *recv_comm, int n, void **data,
 
   nccl_uct_match_drain(comm);
   return ncclSuccess;
+}
+
+static ucs_status_t nccl_uct_ats_callback(void *arg, void *data, size_t length,
+                                          unsigned flags) {
+  nccl_uct_comm_t *comm = *(nccl_uct_comm_t**)data;
+  nccl_uct_rd_req_t **req = (nccl_uct_rd_req_t **)((uint8_t *)data + 8);
+  nccl_uct_rd_req_t **end  = (nccl_uct_rd_req_t **)((uint8_t *)data + length);
+
+
+  for (; req + 1 <= end; req++) {
+    assert((*req)->completion.count == 1);
+    assert((*req)->comm == comm);
+
+    (*req)->completion.count = 0;
+
+  }
+  return UCS_OK;
 }
 
 /* TODO: Pro: one lookup at irecv post or one lookup at isend recv */
@@ -1122,6 +1182,8 @@ static ncclResult_t nccl_uct_worker_create(nccl_uct_worker_t *w,
   NCCLCHECK(nccl_uct_iface_set_rtr_mode(w->uct_iface, NULL));
   NCCLCHECK(nccl_uct_iface_set_handler(w->uct_iface, NCCL_UCT_AM_RTS,
                                        nccl_uct_rts_callback));
+  NCCLCHECK(nccl_uct_iface_set_handler(w->uct_iface, NCCL_UCT_AM_ATS,
+                                       nccl_uct_ats_callback));
   return ncclSuccess;
 
 fail:
@@ -1695,6 +1757,63 @@ static ncclResult_t nccl_uct_iflush(void *recv_comm, int n, void **data,
   return ncclSuccess;
 }
 
+/* TODO reactivate / port iflush */
+static ncclResult_t nccl_uct_rd_iflush(void *recv_comm, int n, void **data,
+                                       int *sizes, void **mhandle,
+                                       void **request) {
+  int last                   = -1;
+  nccl_uct_comm_t *comm      = recv_comm;
+  nccl_uct_memh_t **uct_memh = (nccl_uct_memh_t**)mhandle;
+  nccl_uct_rd_req_t *req;
+  ucs_status_t status;
+  uct_iov_t iov;
+  int i;
+
+  if (comm->gpu_flush.enabled) {
+    for (i = 0; i < n; i++) {
+      if (sizes[i]) {
+        last = i;
+      }
+    }
+  }
+
+  if (last == -1) {
+    return ncclSuccess;
+  }
+
+  req = nccl_uct_rd_req_alloc(comm);
+  if (req == NULL) {
+    *request = NULL;
+    return ncclSuccess;
+  }
+
+  req->send_rts          = -1;
+  req->completion.func   = nccl_uct_empty_callback;
+  req->completion.count  = 1;
+  req->completion.status = UCS_OK;
+
+  iov.buffer = comm->gpu_flush.mem;
+  iov.length = sizeof(comm->gpu_flush.mem);
+  iov.memh   = comm->gpu_flush.memh;
+  iov.stride = 0;
+  iov.count  = 1;
+
+  status = uct_ep_get_zcopy(comm->gpu_flush.uct_ep->ep, &iov, 1,
+                            (uint64_t)data[last], uct_memh[last]->bundle.rkey,
+                            &req->completion);
+  if (status == UCS_OK) {
+    nccl_uct_rd_req_free(req);
+    *request = NULL;
+  } else if (status == UCS_INPROGRESS) {
+    *request = req;
+  } else {
+    WARN("Failed to flush local ep comm=%p status=%d", comm, status);
+    return ncclInternalError;
+  }
+
+  return ncclSuccess;
+}
+
 static ncclResult_t nccl_uct_test(void *request, int *done, int *sizes) {
   nccl_uct_req_t *req     = request;
   nccl_uct_rdesc_t *rdesc = req->rdesc;
@@ -1749,7 +1868,7 @@ static void nccl_uct_rd_send(nccl_uct_rd_req_t *req)
   ucs_status_t status;
 
   assert(req->send_rts == 1);
-  assert(req->completion.count == 1);
+  assert(req->completion.count == 2);
 
   status = uct_ep_am_short(req->comm->uct_ep->ep, NCCL_UCT_AM_RTS,
                            (uint64_t)req->comm->remote_comm, &req->rts,
@@ -1770,11 +1889,12 @@ ncclResult_t nccl_uct_rd_isend(void *send_comm, void *data, int size,
   req = nccl_uct_rd_req_alloc(comm);
   if (req != NULL) {
     req->send_rts         = 1;
-    req->completion.count = 1;
+    req->completion.count = 2;
     req->rts.tag          = tag;
     req->rts.size         = size;
     req->rts.data         = data;
     req->rts.u.rkey       = uct_memh->bundle.rkey;
+    req->rts.opaque       = req;
     req->count            = 1;
 
     nccl_uct_rd_send(req);
@@ -1793,16 +1913,23 @@ ncclResult_t nccl_uct_rd_test(void *request, int *done, int *sizes) {
   nccl_uct_match_drain(comm);
 
   if (req->completion.count > 0) {
-    if (req->send_rts) {
+    if (req->send_rts && req->completion.count == 2) {
       nccl_uct_rd_send(req);
     }
 
-    *done = 0;
-    return ncclSuccess;
+    if ((req->send_rts == 0) && (req->completion.count == 1)) {
+      nccl_uct_rd_send_ats(req);
+    }
+
+    if (req->completion.count > 0) {
+      *done = 0;
+      return ncclSuccess;
+    }
   }
 
   *done = 1;
-  if (sizes != NULL) {
+
+  if ((sizes != NULL) && (req->send_rts > -1)) {
     if (req->send_rts) {
       /* TODO remove rts member and use recv[0] aliased */
       sizes[0] = req->rts.size;
@@ -1847,7 +1974,6 @@ static ncclResult_t nccl_uct_close(void *close_comm) {
   nccl_uct_rdesc_t *rdesc;
   nccl_uct_rd_req_t *req;
 
-  WARN("CLOSE comm %p", comm);
   nccl_uct_ep_destroy(comm->uct_ep);
   if (comm->gpu_flush.uct_ep != NULL) {
     nccl_uct_ep_destroy(comm->gpu_flush.uct_ep);
@@ -1948,7 +2074,7 @@ ncclNet_v8_t ucxUctPlugin_v8 = {
   .deregMr       = nccl_uct_dereg_mr,
   .isend         = nccl_uct_rd_isend,
   .irecv         = nccl_uct_rd_irecv,
-  .iflush        = nccl_uct_iflush,
+  .iflush        = nccl_uct_rd_iflush,
   .test          = nccl_uct_rd_test,
   .closeSend     = nccl_uct_close,
   .closeRecv     = nccl_uct_close,

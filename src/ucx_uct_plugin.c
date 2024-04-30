@@ -202,7 +202,9 @@ static void nccl_uct_ring_init(nccl_uct_ring_t *ring)
 
 static inline unsigned nccl_uct_ring_hash(int tag)
 {
-  return (unsigned)tag & NCCL_UCT_RING_HASH_MASK;
+  unsigned v = tag;
+  v ^= v >> 1;
+  return v & NCCL_UCT_RING_HASH_MASK;
 }
 
 static inline void nccl_uct_ring_append(nccl_uct_ring_t *ring, int tag,

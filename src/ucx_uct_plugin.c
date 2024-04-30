@@ -155,6 +155,103 @@ typedef struct nccl_uct_comm_addr {
   /* TODO: Add multi-QP here */
 } nccl_uct_comm_addr_t;
 
+/* TODO: static assert wwrt MAX REQUESTS */
+#define NCCL_UCT_RING_SIZE      (1 << 9)
+#define NCCL_UCT_RING_MASK      (NCCL_UCT_RING_SIZE - 1)
+
+#define NCCL_UCT_RING_HASH_SIZE (1 << 4)  /* 16 */
+#define NCCL_UCT_RING_HASH_MASK (NCCL_UCT_RING_HASH_SIZE - 1)
+
+typedef struct nccl_uct_ring {
+    unsigned            first;
+    unsigned            last;
+
+    /* Key */
+    int                 tag[NCCL_UCT_RING_SIZE];
+
+    /* Value */
+    struct nccl_uct_ring_data {
+        int i;
+        nccl_uct_rdesc_t *rdesc;
+    } entry[NCCL_UCT_RING_SIZE];
+} nccl_uct_ring_t;
+
+static void nccl_uct_ring_init(nccl_uct_ring_t *ring)
+{
+    int i;
+
+    ring->first = 0;
+    ring->last  = 0;
+    for (i = 0; i < NCCL_UCT_RING_SIZE; i++) {
+        ring->tag[i] = UINT_MAX;
+    }
+}
+
+static inline unsigned nccl_uct_ring_hash(int tag)
+{
+    return (unsigned)tag & NCCL_UCT_RING_HASH_MASK;
+}
+
+static inline void nccl_uct_ring_append(nccl_uct_ring_t *ring,
+                                        nccl_uct_rdesc_t *rdesc,
+                                        unsigned i)
+{
+    int j = ring->last & NCCL_UCT_RING_MASK;
+
+    ring->last++;
+
+    assert(ring->tag[j] == UINT_MAX);
+    assert(rdesc->desc.chunk[i].tag != UINT_MAX);
+
+    /* Touch two cache-lines */
+    ring->tag[j]         = rdesc->desc.chunk[i].tag;
+    ring->entry[j].rdesc = rdesc;
+    ring->entry[j].i     = i;
+
+    assert((ring->last & NCCL_UCT_RING_MASK) !=
+           (ring->first & NCCL_UCT_RING_MASK));
+}
+
+static inline void nccl_uct_ring_consume(nccl_uct_ring_t *ring, unsigned i)
+{
+    unsigned j = i & NCCL_UCT_RING_MASK;
+
+    assert(ring->tag[j] != UINT_MAX);
+    ring->tag[j] = UINT_MAX;
+
+    /* Cleanup upon tag hit */
+    if (i == ring->first) {
+        for (; i != ring->last; i++) {
+            j = i & NCCL_UCT_RING_MASK;
+            if (ring->tag[j] != UINT_MAX) {
+                break;
+            }
+            ring->first = i + 1;
+        }
+    }
+}
+
+static inline struct nccl_uct_ring_data *
+nccl_uct_ring_data(nccl_uct_ring_t *ring, unsigned i)
+{
+    return &ring->entry[i & NCCL_UCT_RING_MASK];
+}
+
+static inline unsigned nccl_uct_ring_find(nccl_uct_ring_t *ring, int tag)
+{
+    int i;
+
+    assert(tag != UINT_MAX);
+
+    for (i = ring->first; i != ring->last; i++) {
+        if (ring->tag[i & NCCL_UCT_RING_MASK] == tag) {
+            return i;
+        }
+    }
+
+    return ring->last;
+}
+
 /* Either Receiver or Sender communicator, connected to one peer */
 typedef struct nccl_uct_comm {
   struct ncclSocket       sock;
@@ -172,7 +269,9 @@ typedef struct nccl_uct_comm {
   uint64_t                rdesc_id;    /* Next sequence number to use */
 
   /* Read mode section */
-  struct nccl_uct_rd_req *free_req;
+  struct nccl_uct_rd_req  *free_req;
+  nccl_uct_ring_t         exp[NCCL_UCT_RING_HASH_SIZE];
+  nccl_uct_ring_t         unexp[NCCL_UCT_RING_HASH_SIZE];
 
 
   const struct nccl_uct_comm *remote_comm; /* Cookie received while connecting */
@@ -945,8 +1044,15 @@ static ncclResult_t nccl_uct_comm_init(nccl_uct_comm_t *comm,
                                        nccl_uct_context_t *context,
                                        nccl_uct_worker_t *worker, int dev,
                                        const nccl_uct_comm_t *remote_comm) {
+  int i;
+
   if (worker == NULL) {
     worker = nccl_uct_worker_get(context, dev);
+  }
+
+  for (i = 0; i < NCCL_UCT_RING_HASH_SIZE; i++) {
+    nccl_uct_ring_init(&comm->exp[i]);
+    nccl_uct_ring_init(&comm->unexp[i]);
   }
 
   comm->uct_worker = worker;

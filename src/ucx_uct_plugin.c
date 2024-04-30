@@ -163,93 +163,90 @@ typedef struct nccl_uct_comm_addr {
 #define NCCL_UCT_RING_HASH_MASK (NCCL_UCT_RING_HASH_SIZE - 1)
 
 typedef struct nccl_uct_ring {
-    unsigned            first;
-    unsigned            last;
+  unsigned            first;
+  unsigned            last;
 
-    /* Key */
-    int                 tag[NCCL_UCT_RING_SIZE];
+  /* Key */
+  int                 tag[NCCL_UCT_RING_SIZE];
 
-    /* Value */
-    struct nccl_uct_ring_data {
-        int i;
-        nccl_uct_rdesc_t *rdesc;
-    } entry[NCCL_UCT_RING_SIZE];
+  /* Value */
+  struct nccl_uct_ring_data {
+    nccl_uct_rts_t rts;
+  } entry[NCCL_UCT_RING_SIZE];
 } nccl_uct_ring_t;
 
 static void nccl_uct_ring_init(nccl_uct_ring_t *ring)
 {
-    int i;
+  int i;
 
-    ring->first = 0;
-    ring->last  = 0;
-    for (i = 0; i < NCCL_UCT_RING_SIZE; i++) {
-        ring->tag[i] = UINT_MAX;
-    }
+  ring->first = 0;
+  ring->last  = 0;
+  for (i = 0; i < NCCL_UCT_RING_SIZE; i++) {
+    ring->tag[i] = UINT_MAX;
+  }
 }
 
 static inline unsigned nccl_uct_ring_hash(int tag)
 {
-    return (unsigned)tag & NCCL_UCT_RING_HASH_MASK;
+  return (unsigned)tag & NCCL_UCT_RING_HASH_MASK;
 }
 
-static inline void nccl_uct_ring_append(nccl_uct_ring_t *ring,
-                                        nccl_uct_rdesc_t *rdesc,
-                                        unsigned i)
+static inline void nccl_uct_ring_append(nccl_uct_ring_t *ring, int tag,
+                                        void *data, size_t len)
 {
-    int j = ring->last & NCCL_UCT_RING_MASK;
+  int j = ring->last & NCCL_UCT_RING_MASK;
 
-    ring->last++;
+  ring->last++;
 
-    assert(ring->tag[j] == UINT_MAX);
-    assert(rdesc->desc.chunk[i].tag != UINT_MAX);
+  assert(ring->tag[j] == UINT_MAX);
+  assert(len <= sizeof(ring->entry[0]));
 
-    /* Touch two cache-lines */
-    ring->tag[j]         = rdesc->desc.chunk[i].tag;
-    ring->entry[j].rdesc = rdesc;
-    ring->entry[j].i     = i;
+  /* Touch two cache-lines */
+  ring->tag[j] = tag;
+  memcpy(&ring->entry[j], data, len);
 
-    assert((ring->last & NCCL_UCT_RING_MASK) !=
-           (ring->first & NCCL_UCT_RING_MASK));
+  assert((ring->last & NCCL_UCT_RING_MASK) !=
+         (ring->first & NCCL_UCT_RING_MASK));
 }
 
 static inline void nccl_uct_ring_consume(nccl_uct_ring_t *ring, unsigned i)
 {
-    unsigned j = i & NCCL_UCT_RING_MASK;
+  unsigned j = i & NCCL_UCT_RING_MASK;
 
-    assert(ring->tag[j] != UINT_MAX);
-    ring->tag[j] = UINT_MAX;
+  assert(ring->tag[j] != UINT_MAX);
+  ring->tag[j] = UINT_MAX;
 
-    /* Cleanup upon tag hit */
-    if (i == ring->first) {
-        for (; i != ring->last; i++) {
-            j = i & NCCL_UCT_RING_MASK;
-            if (ring->tag[j] != UINT_MAX) {
-                break;
-            }
-            ring->first = i + 1;
-        }
+  /* Cleanup upon tag hit */
+  if (i == ring->first) {
+    for (; i != ring->last; i++) {
+      j = i & NCCL_UCT_RING_MASK;
+      if (ring->tag[j] != UINT_MAX) {
+        break;
+      }
+      ring->first = i + 1;
     }
+  }
 }
 
-static inline struct nccl_uct_ring_data *
+  static inline struct nccl_uct_ring_data *
 nccl_uct_ring_data(nccl_uct_ring_t *ring, unsigned i)
 {
-    return &ring->entry[i & NCCL_UCT_RING_MASK];
+  return &ring->entry[i & NCCL_UCT_RING_MASK];
 }
 
 static inline unsigned nccl_uct_ring_find(nccl_uct_ring_t *ring, int tag)
 {
-    int i;
+  int i;
 
-    assert(tag != UINT_MAX);
+  assert(tag != UINT_MAX);
 
-    for (i = ring->first; i != ring->last; i++) {
-        if (ring->tag[i & NCCL_UCT_RING_MASK] == tag) {
-            return i;
-        }
+  for (i = ring->first; i != ring->last; i++) {
+    if (ring->tag[i & NCCL_UCT_RING_MASK] == tag) {
+      return i;
     }
+  }
 
-    return ring->last;
+  return ring->last;
 }
 
 /* Either Receiver or Sender communicator, connected to one peer */
@@ -699,8 +696,24 @@ static ucs_status_t nccl_uct_rtr_callback(void *arg, void *data, size_t length,
   return UCS_OK;
 }
 
+/* TODO: Pro: one lookup at irecv post or one lookup at isend recv */
 static ucs_status_t nccl_uct_rts_callback(void *arg, void *data, size_t length,
                                           unsigned flags) {
+  nccl_uct_comm_t *comm = *(nccl_uct_comm_t**)data;
+  nccl_uct_rts_t *rts   = (nccl_uct_rts_t *)((uint8_t *)data + 8);
+  nccl_uct_ring_t *exp;
+  int i, index;
+
+  assert(length == (sizeof(*rts) + 8));
+
+  /* Do we already expect it? */
+  index = nccl_uct_ring_hash(rts->tag);
+  exp   = &comm->exp[index];
+  i     = nccl_uct_ring_find(exp, rts->tag);
+  if (i == exp->last) {
+    nccl_uct_ring_append(&comm->unexp[index], rts->tag, rts, sizeof(*rts));
+  }
+
   return UCS_OK;
 }
 
@@ -1616,6 +1629,18 @@ ncclResult_t nccl_uct_rd_isend(void *send_comm, void *data, int size,
   }
 
   *request = req;
+  return ncclSuccess;
+}
+
+ncclResult_t nccl_uct_rd_irecv(void *recv_comm, int n, void **data,
+                                      int *sizes, int *tags, void **mhandles,
+                                      void **request) {
+  nccl_uct_comm_t *comm      = recv_comm;
+  nccl_uct_memh_t **uct_memh = (nccl_uct_memh_t**)mhandles;
+  ucs_status_t status;
+  (void)status;
+  (void)comm;
+  (void)uct_memh;
   return ncclSuccess;
 }
 

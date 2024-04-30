@@ -909,6 +909,7 @@ static ucs_status_t nccl_uct_ats_callback(void *arg, void *data, size_t length,
   nccl_uct_rd_req_t **end  = (nccl_uct_rd_req_t **)((uint8_t *)data + length);
 
 
+  (void)comm;
   for (; req + 1 <= end; req++) {
     assert((*req)->completion.count == 1);
     assert((*req)->comm == comm);

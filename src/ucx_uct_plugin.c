@@ -462,7 +462,14 @@ static uct_iface_h nccl_uct_resource_iface_open(uct_worker_h worker,
     return NULL;
   }
 
-  status = uct_config_modify(config, "RC_MLX5_TX_CQ_MODERATION", "128");
+#if 0
+  status = uct_config_modify(config, "RC_MLX5_TX_POLL_ALWAYS", "y");
+  if (status != UCS_OK) {
+    WARN("Failed to modify MD iface config TX POLL for TL '%s': error %d", tl->tl_name, status);
+		return NULL;
+  }
+
+  status = uct_config_modify(config, "RC_MLX5_TX_CQ_MODERATION", "0");
   if (status != UCS_OK) {
     WARN("Failed to modify MD iface config CQ MOD for TL '%s': error %d", tl->tl_name, status);
 		return NULL;
@@ -473,6 +480,7 @@ static uct_iface_h nccl_uct_resource_iface_open(uct_worker_h worker,
     WARN("Failed to modify MD iface config CQ LEN for TL '%s': error %d", tl->tl_name, status);
 	  return NULL;
 	}
+#endif
 
 
   params.field_mask =

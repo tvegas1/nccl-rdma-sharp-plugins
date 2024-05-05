@@ -132,6 +132,7 @@ typedef struct {
     nccl_uct_memh_t *uct_memh;
   } u;
   struct nccl_uct_rd_req *opaque;
+  unsigned index;
 } nccl_uct_mem_t;
 
 /*
@@ -792,6 +793,7 @@ static void nccl_uct_match_add(nccl_uct_comm_t *comm, nccl_uct_mem_t *src,
          (comm->get.last & NCCL_UCT_GET_PARAM_MASK));
 
   dst->size = src->size;
+	req->recv[dst->index].size = src->size;
 
   req->remote_req[req->rts_count++] = src->opaque;
   assert(req->rts_count <= NCCL_UCX_UCT_MAX_RECVS);
@@ -799,7 +801,7 @@ static void nccl_uct_match_add(nccl_uct_comm_t *comm, nccl_uct_mem_t *src,
   param->iov.buffer = dst->data;
   param->iov.length = dst->size;
   param->iov.memh   = dst->u.uct_memh->memh;
-  param->iov.stride = dst->size;
+  param->iov.stride = 0;
   param->iov.count  = 1;
   param->rva        = (uint64_t)src->data;
   param->rkey       = src->u.rkey;
@@ -873,7 +875,7 @@ ncclResult_t nccl_uct_rd_irecv(void *recv_comm, int n, void **data,
   req->started            = 0;
   req->ats_sent           = 0;
 
-  assert(n < NCCL_UCX_UCT_MAX_RECVS);
+  assert(n <= NCCL_UCX_UCT_MAX_RECVS);
 
   for (i = 0; i < n; i++) {
     req->recv[i].tag        = tags[i];
@@ -881,6 +883,7 @@ ncclResult_t nccl_uct_rd_irecv(void *recv_comm, int n, void **data,
     req->recv[i].data       = data[i];
     req->recv[i].u.uct_memh = uct_memh[i];
     req->recv[i].opaque     = req;
+    req->recv[i].index      = i;
   }
 
   /* Build match list */
@@ -1909,11 +1912,17 @@ ncclResult_t nccl_uct_rd_isend(void *send_comm, void *data, int size,
     req->rts.u.rkey       = uct_memh->bundle.rkey;
     req->rts.opaque       = req;
     req->count            = 1;
+		/* TODO: add sequence number and check it */
 
     nccl_uct_rd_send(req);
   }
 
-  *request = req;
+	if (req->completion.count == 2) {
+    nccl_uct_rd_req_free(req);
+		*request = NULL;
+	} else {
+		*request = req;
+  }
   return ncclSuccess;
 }
 
@@ -1922,7 +1931,8 @@ ncclResult_t nccl_uct_rd_test(void *request, int *done, int *sizes) {
   nccl_uct_comm_t *comm   = req->comm;
   int i;
 
-  uct_worker_progress(comm->uct_worker->worker);
+  while (uct_worker_progress(comm->uct_worker->worker)) {}
+
   nccl_uct_match_drain(comm);
 
   if (req->completion.count > 0) {

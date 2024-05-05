@@ -775,8 +775,10 @@ static void nccl_uct_rd_send_ats(nccl_uct_rd_req_t *req)
   assert(req->rts_count == req->count);
   assert(req->completion.count == 1);
 
+#if 0
   status = uct_ep_fence(req->comm->uct_ep->ep, 0);
   assert(status == UCS_OK);
+#endif
 
   status = uct_ep_am_short(req->comm->uct_ep->ep, NCCL_UCT_AM_ATS,
                            (uint64_t)req->comm->remote_comm,

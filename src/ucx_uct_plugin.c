@@ -16,6 +16,19 @@
 #define NCCL_UCT_LISTEN_HANDLE_MAGIC 0x43cf19ed91abdb85
 #define NCCL_UCT_REG_ALIGN           4096
 
+/*
+TODO: TRY
+ 120   {"TX_CQ_MODERATION", "64",
+ 121    "Maximum number of send WQEs which can be posted without requesting a completion.",
+ 122    ucs_offsetof(uct_rc_iface_config_t, tx_cq_moderation), UCS_CONFIG_TYPE_UINT},
+ 123
+ 124   {"TX_CQ_LEN", "4096",
+ 125    "Length of send completion queue. This limits the total number of outstanding signaled sends.",
+ 126    ucs_offsetof(uct_rc_iface_config_t, tx_cq_len), UCS_CONFIG_TYPE_UINT},
+ 127
+
+*/
+
 typedef enum {
   NCCL_UCT_START = 0,
   NCCL_UCT_CONNECT,
@@ -449,6 +462,19 @@ static uct_iface_h nccl_uct_resource_iface_open(uct_worker_h worker,
     return NULL;
   }
 
+  status = uct_config_modify(config, "RC_MLX5_TX_CQ_MODERATION", "128");
+  if (status != UCS_OK) {
+    WARN("Failed to modify MD iface config CQ MOD for TL '%s': error %d", tl->tl_name, status);
+		return NULL;
+  }
+
+  status = uct_config_modify(config, "RC_MLX5_TX_CQ_LEN", "8192");
+  if (status != UCS_OK) {
+    WARN("Failed to modify MD iface config CQ LEN for TL '%s': error %d", tl->tl_name, status);
+	  return NULL;
+	}
+
+
   params.field_mask =
       UCT_IFACE_PARAM_FIELD_OPEN_MODE | UCT_IFACE_PARAM_FIELD_DEVICE |
       UCT_IFACE_PARAM_FIELD_STATS_ROOT | UCT_IFACE_PARAM_FIELD_RX_HEADROOM;
@@ -759,6 +785,11 @@ static ucs_status_t nccl_uct_get_zcopy(nccl_uct_comm_t *comm,
 {
   ucs_status_t status;
 
+  if (param->iov.length == 0) {
+    param->completion->count--;
+		goto done;
+  }
+
   status = uct_ep_get_zcopy(comm->uct_ep->ep, &param->iov, 1, param->rva,
                             param->rkey, param->completion);
   if (status == UCS_OK) {
@@ -767,6 +798,7 @@ static ucs_status_t nccl_uct_get_zcopy(nccl_uct_comm_t *comm,
     return status;
   }
 
+done:
   param->req->started++;
   assert(param->req->started <= param->req->count);
 

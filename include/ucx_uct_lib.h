@@ -86,7 +86,13 @@ typedef struct {
 /* All the remote addresses for the communicator */
 typedef struct nccl_uct_comm_addr {
   nccl_uct_ep_addr_t rma;
-  /* TODO: Add multi-QP here */
+
+  void                *rtr_ptr;
+  uct_rkey_h          rtr_rkey;
+
+  void                *atp_ptr;
+  uct_rkey_h          atp_rkey;
+
 } nccl_uct_comm_addr_t;
 
 /* Either Receiver or Sender communicator, connected to one peer */

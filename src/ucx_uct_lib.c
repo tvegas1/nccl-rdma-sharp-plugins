@@ -559,6 +559,11 @@ ncclResult_t nccl_uct_connect(int dev, void *listen_handle, void **send_comm,
 
     NCCLCHECK(nccl_uct_ep_addr_set(&remote.addr.rma, comm, comm->uct_ep));
     remote.comm = comm;
+    remote.addr.rtr_ptr  = comm->remote.rtr_ptr;
+    remote.addr.rtr_rkey = comm->remote.rtr_rkey;
+    remote.addr.atp_ptr  = comm->remote.atp_ptr;
+    remote.addr.atp_rkey = comm->remote.atp_rkey;
+
     NCCLCHECK(ncclSocketSend(&comm->sock, &remote, sizeof(remote)));
 
     stage->offset = 0;
@@ -625,6 +630,11 @@ ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm,
     }
 
     NCCLCHECK(nccl_uct_ep_addr_set(&addr.rma, comm, comm->uct_ep));
+    addr.rtr_ptr  = comm->remote.rtr_ptr;
+    addr.rtr_rkey = comm->remote.rtr_rkey;
+    addr.atp_ptr  = comm->remote.atp_ptr;
+    addr.atp_rkey = comm->remote.atp_rkey;
+
     NCCLCHECK(ncclSocketSend(&comm->sock, &addr, sizeof(addr)));
 
     stage->offset = 0;

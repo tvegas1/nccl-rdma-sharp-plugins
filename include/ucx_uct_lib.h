@@ -88,10 +88,10 @@ typedef struct nccl_uct_comm_addr {
   nccl_uct_ep_addr_t rma;
 
   void                *rtr_ptr;
-  uct_rkey_h          rtr_rkey;
+  uct_rkey_t          rtr_rkey;
 
   void                *atp_ptr;
-  uct_rkey_h          atp_rkey;
+  uct_rkey_t          atp_rkey;
 
 } nccl_uct_comm_addr_t;
 

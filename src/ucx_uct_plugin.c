@@ -39,6 +39,7 @@ typedef struct nccl_uct_chunk {
 
 /* On the wire request message */
 typedef struct {
+    unsigned         id_start;
     nccl_uct_chunk_t chunk[NCCL_UCX_UCT_MAX_RECVS];
     unsigned         count;         /* Total number of chunks */
     unsigned         avail;         /* Total number of chunk left */
@@ -96,6 +97,7 @@ static ucs_status_t nccl_uct_atp_callback(void *arg, void *data, size_t length,
   nccl_uct_atp_t *src_atp  = (nccl_uct_atp_t*)((uint8_t*)data + 8);
 
   assert(length == (sizeof(*src_atp) + 8));
+  assert(comm->atp[src_atp->rtr_id & NCCL_UCT_RING_MASK].rtr_id == src_atp->rtr_id);
   memcpy(&comm->atp[src_atp->rtr_id & NCCL_UCT_RING_MASK], src_atp, sizeof(*src_atp));
   return UCS_OK;
 }
@@ -190,6 +192,7 @@ static ncclResult_t nccl_uct_wr_irecv(void *recv_comm, int n, void **data,
   rtr->avail    = n;
   rtr->send_atp = NCCL_UCT_ATP;
   rtr->id       = comm->rtr_id;
+  rtr->id_start = comm->rtr_id;
 
   atp         = &comm->atp[comm->rtr_id & NCCL_UCT_RING_MASK];
   atp->rtr_id = rtr->id;
@@ -219,8 +222,9 @@ static ncclResult_t nccl_uct_wr_irecv(void *recv_comm, int n, void **data,
   req->id                = comm->rtr_id;
   req->comm              = comm;
 
+  __sync_synchronize();
   status = nccl_uct_put(comm, rtr, sizeof(*rtr), comm->rtr_memh,
-                        (nccl_uct_rtr_t *)comm->base.remote.addr.rtr_ptr + (comm->rtr_id & NCCL_UCT_RING_MASK),
+                    ((nccl_uct_rtr_t *)comm->base.remote.addr.rtr_ptr) + (comm->rtr_id & NCCL_UCT_RING_MASK),
                         comm->base.remote.addr.rtr_rkey,
                         &req->completion);
   if ((status == UCS_OK) || (status == UCS_INPROGRESS)) {
@@ -300,12 +304,12 @@ static ncclResult_t nccl_uct_wr_isend(void *send_comm, void *data, int size,
                                       int tag, void *mhandle, void **request) {
   nccl_uct_wr_comm_t *comm = nccl_uct_wr_comm_get(send_comm);
   volatile nccl_uct_rtr_t *rtr;
-  int id, i;
+  unsigned id, i;
   unsigned end = NCCL_UCX_UCT_MAX_RECVS;
 
   for (id = comm->rtr_id;; id++) {
       rtr = &comm->rtr[id & NCCL_UCT_RING_MASK];
-      if (rtr->id != id) {
+      if (rtr->id != id || rtr->id_start != id) {
           break;
       }
 
@@ -407,7 +411,7 @@ static void nccl_uct_wr_send_atp(nccl_uct_wr_comm_t *comm, nccl_uct_req_t *req,
 static ncclResult_t nccl_uct_wr_test(void *request, int *done, int *sizes) {
   nccl_uct_req_t *req      = request;
   nccl_uct_wr_comm_t *comm = req->comm;
-  int end                  = NCCL_UCT_RING_MASK;
+  int end                   = NCCL_UCX_UCT_MAX_RECVS;
   volatile nccl_uct_atp_t *atp;
 
   while (uct_worker_progress(comm->base.uct_worker->worker)) {}

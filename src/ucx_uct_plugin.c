@@ -53,9 +53,18 @@ typedef struct {
     nccl_uct_req_type_t     type;       /* Type of the request */
     unsigned                id;         /* RTR id of the request (not for flush) */
     unsigned                size;       /* Size of the send request (isend) */
+    unsigned                idx;
 } nccl_uct_req_t;
 
-#define NCCL_UCT_RING_SIZE (MAX_REQUESTS * 4)
+#define NCCL_UCT_RING_SIZE (128 * 4)    /* TODO: Add build static checks */
+#define NCCL_UCT_RING_MASK (NCCL_UCT_RING_SIZE - 1)
+
+#if 0
+#define TSHOOT(...) WARN(__VA_ARGS__)
+#else
+#define TSHOOT(...)
+#endif
+
 
 typedef struct nccl_uct_wr_comm {
   nccl_uct_comm_t      base;
@@ -204,13 +213,13 @@ static ncclResult_t nccl_uct_wr_irecv(void *recv_comm, int n, void **data,
 
   assert(n <= end);
 
-  rtr           = &comm->rtr[comm->rtr_id & NCCL_UCT_RING_SIZE];
+  rtr           = &comm->rtr[comm->rtr_id & NCCL_UCT_RING_MASK];
   rtr->count    = n;
   rtr->avail    = n;
   rtr->send_atp = NCCL_UCT_COMPLETE_ATP;
   rtr->id       = comm->rtr_id;
 
-  atp         = &comm->atp[comm->rtr_id & NCCL_UCT_RING_SIZE];
+  atp         = &comm->atp[comm->rtr_id & NCCL_UCT_RING_MASK];
   atp->rtr_id = rtr->id;
   atp->idx    = rtr->id;
 
@@ -229,7 +238,7 @@ static ncclResult_t nccl_uct_wr_irecv(void *recv_comm, int n, void **data,
       rtr->chunk[idx].rkey = uct_memh[i]->bundle.rkey;
   }
 
-  req                    = &comm->req[comm->req_id & NCCL_UCT_RING_SIZE];
+  req                    = &comm->req[comm->req_id & NCCL_UCT_RING_MASK];
   req->completion.func   = nccl_uct_empty_callback;
   req->completion.count  = 1;
   req->completion.status = UCS_OK;
@@ -238,11 +247,12 @@ static ncclResult_t nccl_uct_wr_irecv(void *recv_comm, int n, void **data,
   req->comm              = comm;
 
   status = nccl_uct_put(comm, rtr, sizeof(*rtr), comm->rtr_memh,
-                        (nccl_uct_rtr_t *)comm->base.remote.addr.rtr_ptr + (comm->rtr_id & NCCL_UCT_RING_SIZE),
+                        (nccl_uct_rtr_t *)comm->base.remote.addr.rtr_ptr + (comm->rtr_id & NCCL_UCT_RING_MASK),
                         comm->base.remote.addr.rtr_rkey,
                         &req->completion);
   if ((status == UCS_OK) || (status == UCS_INPROGRESS)) {
       *request = req;
+      TSHOOT("irecv send n=%d req_id=%u rtr_id=%u", n, comm->req_id, comm->rtr_id);
       comm->req_id++;
       comm->rtr_id++;
   } else {
@@ -257,13 +267,13 @@ static ncclResult_t nccl_uct_send(nccl_uct_wr_comm_t *comm, unsigned id,
                                   nccl_uct_memh_t *uct_memh, void **request)
 {
     int end                      = NCCL_UCX_UCT_MAX_RECVS;
-    volatile nccl_uct_rtr_t *rtr = &comm->rtr[id & NCCL_UCT_RING_SIZE];
-    nccl_uct_atp_t *atp          = &comm->atp[id & NCCL_UCT_RING_SIZE];
+    volatile nccl_uct_rtr_t *rtr = &comm->rtr[id & NCCL_UCT_RING_MASK];
+    nccl_uct_atp_t *atp          = &comm->atp[id & NCCL_UCT_RING_MASK];
     volatile nccl_uct_chunk_t *chunk      = &rtr->chunk[end - rtr->count + i];
     nccl_uct_req_t *req;
     ucs_status_t status;
 
-    req                    = &comm->req[comm->req_id & NCCL_UCT_RING_SIZE];
+    req                    = &comm->req[comm->req_id & NCCL_UCT_RING_MASK];
     req->completion.func   = nccl_uct_empty_callback;
     req->completion.count  = 3;
     req->completion.status = UCS_OK;
@@ -271,6 +281,7 @@ static ncclResult_t nccl_uct_send(nccl_uct_wr_comm_t *comm, unsigned id,
     req->id                = id;
     req->size              = size;
     req->comm              = comm;
+    req->idx               = i;
 
     assert(size <= chunk->size);
 
@@ -282,6 +293,8 @@ static ncclResult_t nccl_uct_send(nccl_uct_wr_comm_t *comm, unsigned id,
     }
 
     if (rtr->avail == rtr->count) {
+        TSHOOT("%p isend new req_id=%u count=%u send_atp=%u atp=%p",
+             comm, rtr->id, rtr->count, rtr->send_atp, atp);
         atp->rtr_id   = rtr->id;
         atp->count    = rtr->count;
         atp->start    = rtr->count;
@@ -289,6 +302,8 @@ static ncclResult_t nccl_uct_send(nccl_uct_wr_comm_t *comm, unsigned id,
         atp->send_atp = rtr->send_atp;
         atp->idx      = rtr->id;
     } 
+
+    TSHOOT("%p isend started req=%p req->id=%u idx=%u/%u size=%d", req, comm, id, i, rtr->count, size);
 
     assert(atp->rtr_id == rtr->id);
     assert(rtr->count == atp->count);
@@ -311,7 +326,7 @@ static ncclResult_t nccl_uct_wr_isend(void *send_comm, void *data, int size,
   unsigned end = NCCL_UCX_UCT_MAX_RECVS;
 
   for (id = comm->rtr_id;; id++) {
-      rtr = &comm->rtr[id & NCCL_UCT_RING_SIZE];
+      rtr = &comm->rtr[id & NCCL_UCT_RING_MASK];
       if (rtr->id != id) {
           break;
       }
@@ -324,6 +339,7 @@ static ncclResult_t nccl_uct_wr_isend(void *send_comm, void *data, int size,
           }
           continue;
       }
+      TSHOOT("isend got id=%u n=%u", id, rtr->count);
 
       for (i = 0; i < rtr->count; i++) {
           if (rtr->chunk[end - rtr->count + i].tag == tag) {
@@ -350,7 +366,7 @@ static ncclResult_t nccl_uct_wr_iflush(void *recv_comm, int n, void **data,
   }
 
   /* Consume request anyways */
-  req                    = &comm->req[comm->req_id++ & NCCL_UCT_RING_SIZE];
+  req                    = &comm->req[comm->req_id++ & NCCL_UCT_RING_MASK];
   req->completion.func   = nccl_uct_empty_callback;
   req->completion.count  = 1;
   req->completion.status = UCS_OK;
@@ -383,8 +399,12 @@ static void nccl_uct_wr_send_atp(nccl_uct_wr_comm_t *comm, nccl_uct_req_t *req,
         req->completion.count = 1;
         req->completion.status = UCS_OK;
 
+        status = uct_ep_fence(comm->base.uct_ep->ep, 0);
+        assert(status == UCS_OK);
+
+        TSHOOT("%p atp_put req->id=%u", comm, req->id);
         status = nccl_uct_put(comm, atp, sizeof(*atp), comm->atp_memh,
-                              (nccl_uct_atp_t *)comm->base.remote.addr.atp_ptr + (req->id & NCCL_UCT_RING_SIZE),
+                              (nccl_uct_atp_t *)comm->base.remote.addr.atp_ptr + (req->id & NCCL_UCT_RING_MASK),
                               comm->base.remote.addr.atp_rkey,
                               &req->completion);
         if (status == UCS_ERR_NO_RESOURCE) { 
@@ -399,36 +419,40 @@ static void nccl_uct_wr_send_atp(nccl_uct_wr_comm_t *comm, nccl_uct_req_t *req,
 static ncclResult_t nccl_uct_wr_test(void *request, int *done, int *sizes) {
   nccl_uct_req_t *req      = request;
   nccl_uct_wr_comm_t *comm = req->comm;
-  int end                  = NCCL_UCT_RING_SIZE;
+  int end                  = NCCL_UCT_RING_MASK;
   volatile nccl_uct_atp_t *atp;
 
   while (uct_worker_progress(comm->base.uct_worker->worker)) {}
 
   if (req->type == NCCL_UCT_IRECV) {
       if (req->completion.count > 0) {
+          *done = 0;
           return ncclSuccess;
       }
 
-      atp = &comm->atp[req->id & NCCL_UCT_RING_SIZE];
+      atp = &comm->atp[req->id & NCCL_UCT_RING_MASK];
       assert(atp->rtr_id == req->id);
-      assert(comm->rtr[req->id & NCCL_UCT_RING_SIZE].id == req->id);
+      assert(comm->rtr[req->id & NCCL_UCT_RING_MASK].id == req->id);
 
       *done = (atp->idx == atp->rtr_id);
       if (*done) {
+          TSHOOT("%p irecv rtr_id=%u completed", comm, req->id);
           memcpy(sizes, (void *)&atp->sizes[end - atp->count],
                  atp->count * sizeof(*atp));
       }
   } else if (req->type == NCCL_UCT_ISEND) {
-      atp = &comm->atp[req->id & NCCL_UCT_RING_SIZE];
+      atp = &comm->atp[req->id & NCCL_UCT_RING_MASK];
 
       if (req->completion.count == 2) {
           atp->complete--; /* actual isend is done */
           req->completion.count = 0;
+          TSHOOT("%p isend req->id=%u put completed", comm, req->id);
       }
 
       nccl_uct_wr_send_atp(comm, req, (nccl_uct_atp_t *)atp);
 
       if ((req->completion.count == 0) && (!atp->send_atp || atp->complete)) {
+          TSHOOT("%p isend req->id=%u i=%u done", comm, req->id, req->idx);
           *done = 1;
           if (sizes) {
               *sizes = req->size;

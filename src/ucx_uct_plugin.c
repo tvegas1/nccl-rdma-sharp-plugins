@@ -48,10 +48,11 @@ typedef struct {
 
 /* Track the sending of a request */
 typedef struct {
-    uct_complete_t      complete;   /* Completion for put and others */
-    nccl_uct_req_type_t type;       /* Type of the request */
-    unsigned            id;         /* RTR id of the request (not for flush) */
-    unsigned            size;       /* Size of the send request (isend) */
+    uct_completion_t        completion; /* Completion for put and others */
+    struct nccl_uct_wr_comm *comm;      /* Owning communicator */
+    nccl_uct_req_type_t     type;       /* Type of the request */
+    unsigned                id;         /* RTR id of the request (not for flush) */
+    unsigned                size;       /* Size of the send request (isend) */
 } nccl_uct_req_t;
 
 #define NCCL_UCT_RING_SIZE (MAX_REQUESTS * 4)
@@ -62,8 +63,8 @@ typedef struct nccl_uct_wr_comm {
   nccl_uct_atp_t       atp[NCCL_UCT_RING_SIZE];
   nccl_uct_rtr_t       rtr[NCCL_UCT_RING_SIZE];
 
-  nccl_uct_memh_t      atp_memh;
-  nccl_uct_memh_t      rtr_memh;
+  nccl_uct_memh_t      *atp_memh;
+  nccl_uct_memh_t      *rtr_memh;
 
   /* NCCL request for isend, irecv or iflush */
   nccl_uct_req_t       req[NCCL_UCT_RING_SIZE];
@@ -107,13 +108,13 @@ static ncclResult_t nccl_uct_wr_comm_init(nccl_uct_comm_t *base_comm,
   nccl_uct_wr_comm_t *comm = nccl_uct_wr_comm_get(base_comm);
 
   NCCLCHECK(nccl_uct_comm_init(&comm->base, context, worker, dev, remote_comm));
-  NCCLCHECK(nccl_uct_reg_mr(comm, comm->rtr, sizeof(comm->rtr), 0, &comm->rtr_memh));
-  NCCLCHECK(nccl_uct_reg_mr(comm, comm->atp, sizeof(comm->atp), 0, &comm->atp_memh));
+  NCCLCHECK(nccl_uct_reg_mr(comm, comm->rtr, sizeof(comm->rtr), 0, (void **)&comm->rtr_memh));
+  NCCLCHECK(nccl_uct_reg_mr(comm, comm->atp, sizeof(comm->atp), 0, (void **)&comm->atp_memh));
 
-  comm->remote.addr.rtr_ptr  = comm->rtr;
-  comm->remote.addr.rtr_rkey = comm->rtr_memh->bundle.rkey;
-  comm->remote.addr.atp_ptr  = comm->atp;
-  comm->remote.addr.atp_rkey = comm->atp_memh->bundle.rkey;
+  comm->base.remote.addr.rtr_ptr  = comm->rtr;
+  comm->base.remote.addr.rtr_rkey = comm->rtr_memh->bundle.rkey;
+  comm->base.remote.addr.atp_ptr  = comm->atp;
+  comm->base.remote.addr.atp_rkey = comm->atp_memh->bundle.rkey;
 
   comm->rtr_id = 1;
   return ncclSuccess;
@@ -130,11 +131,11 @@ static ncclResult_t nccl_uct_wr_init(ncclDebugLogger_t logFunction) {
                           &context.if_addr, NULL, logFunction);
 }
 
+#if 0
 /* TODO also fix send ATP when AR is disabled */
 /* Outcome is either send_atp equal to 1 or 0 */
 static void nccl_uct_send_atp(nccl_uct_wr_comm_t *comm,
                               nccl_uct_rdesc_t *rdesc) {
-#if 0
   ucs_status_t status;
   nccl_uct_atp_t atp;
   int i;
@@ -160,14 +161,14 @@ static void nccl_uct_send_atp(nccl_uct_wr_comm_t *comm,
   if (status == UCS_OK) {
     rdesc->send_atp = 0;
   }
-#endif
   return UCS_OK;
 }
+#endif
 
 static ncclResult_t nccl_uct_put(nccl_uct_wr_comm_t *comm,
                                  void *data, size_t size,
                                  nccl_uct_memh_t *uct_memh,
-                                 void *rva, uct_rkey_h rkey,
+                                 void *rva, uct_rkey_t rkey,
                                  uct_completion_t *completion)
 {
     ucs_status_t status;
@@ -180,7 +181,7 @@ static ncclResult_t nccl_uct_put(nccl_uct_wr_comm_t *comm,
     iov.count  = 1;
 
     status = uct_ep_put_zcopy(comm->base.uct_ep->ep, &iov, 1,
-                              rva, rkey, completion);
+                              (uint64_t)rva, rkey, completion);
     if (status == UCS_OK) {
         completion->count--;
     } else if (status != UCS_INPROGRESS) {
@@ -195,7 +196,7 @@ static ncclResult_t nccl_uct_wr_irecv(void *recv_comm, int n, void **data,
                                       void **request) {
   nccl_uct_wr_comm_t *comm   = nccl_uct_wr_comm_get(recv_comm);
   nccl_uct_memh_t **uct_memh = (nccl_uct_memh_t**)mhandles;
-  int i, end = NCCL_UCX_UCT_MAX_RECVS;
+  int i, idx, end = NCCL_UCX_UCT_MAX_RECVS;
   nccl_uct_rtr_t *rtr;
   volatile nccl_uct_atp_t *atp;
   nccl_uct_req_t *req;
@@ -215,9 +216,9 @@ static ncclResult_t nccl_uct_wr_irecv(void *recv_comm, int n, void **data,
 
   if (rtr->send_atp) {
       atp->idx -= 0x01010101; /* Make it different */
-      memset(atp->sizes, 0, sizeof(atp->sizes));
+      memset((void *)atp->sizes, 0, sizeof(atp->sizes));
   } else {
-      memcpy(atp->sizes + end - n, sizes, n * sizeof(*sizes));
+      memcpy((void *)(atp->sizes + end - n), sizes, n * sizeof(*sizes));
   }
 
   idx = end - n;
@@ -225,19 +226,20 @@ static ncclResult_t nccl_uct_wr_irecv(void *recv_comm, int n, void **data,
       rtr->chunk[idx].data = data[i];
       rtr->chunk[idx].size = sizes[i];
       rtr->chunk[idx].tag  = tags[i];
-      rtr->chunk[idx].rkey = uct_memh[i].bundle.rkey;
+      rtr->chunk[idx].rkey = uct_memh[i]->bundle.rkey;
   }
 
   req                    = &comm->req[comm->req_id & NCCL_UCT_RING_SIZE];
   req->completion.func   = nccl_uct_empty_callback;
   req->completion.count  = 1;
   req->completion.status = UCS_OK;
-  req->type              = NCCL_UCT_REQ_IRECV;
+  req->type              = NCCL_UCT_IRECV;
   req->id                = comm->rtr_id;
+  req->comm              = comm;
 
   status = nccl_uct_put(comm, rtr, sizeof(*rtr), comm->rtr_memh,
-                        (nccl_uct_rtr_t *)comm->remote.addr.rtr_ptr + (comm->rtr_id & NCCL_UCT_RING_SIZE),
-                        comm->remote.addr.rtr_rkey,
+                        (nccl_uct_rtr_t *)comm->base.remote.addr.rtr_ptr + (comm->rtr_id & NCCL_UCT_RING_SIZE),
+                        comm->base.remote.addr.rtr_rkey,
                         &req->completion);
   if ((status == UCS_OK) || (status == UCS_INPROGRESS)) {
       *request = req;
@@ -257,16 +259,18 @@ static ncclResult_t nccl_uct_send(nccl_uct_wr_comm_t *comm, unsigned id,
     int end                      = NCCL_UCX_UCT_MAX_RECVS;
     volatile nccl_uct_rtr_t *rtr = &comm->rtr[id & NCCL_UCT_RING_SIZE];
     nccl_uct_atp_t *atp          = &comm->atp[id & NCCL_UCT_RING_SIZE];
-    nccl_uct_chunk_t *chunk      = rtr->chunk[end - rtr->count + i];
+    volatile nccl_uct_chunk_t *chunk      = &rtr->chunk[end - rtr->count + i];
+    nccl_uct_req_t *req;
     ucs_status_t status;
 
     req                    = &comm->req[comm->req_id & NCCL_UCT_RING_SIZE];
     req->completion.func   = nccl_uct_empty_callback;
     req->completion.count  = 3;
     req->completion.status = UCS_OK;
-    req->type              = NCCL_UCT_REQ_ISEND;
+    req->type              = NCCL_UCT_ISEND;
     req->id                = id;
     req->size              = size;
+    req->comm              = comm;
 
     assert(size <= chunk->size);
 
@@ -303,8 +307,8 @@ static ncclResult_t nccl_uct_wr_isend(void *send_comm, void *data, int size,
                                       int tag, void *mhandle, void **request) {
   nccl_uct_wr_comm_t *comm = nccl_uct_wr_comm_get(send_comm);
   volatile nccl_uct_rtr_t *rtr;
-  int id, i, end = NCCL_UCX_UCT_MAX_RECVS;
-  unsigned end;
+  int id, i;
+  unsigned end = NCCL_UCX_UCT_MAX_RECVS;
 
   for (id = comm->rtr_id;; id++) {
       rtr = &comm->rtr[id & NCCL_UCT_RING_SIZE];
@@ -350,15 +354,16 @@ static ncclResult_t nccl_uct_wr_iflush(void *recv_comm, int n, void **data,
   req->completion.func   = nccl_uct_empty_callback;
   req->completion.count  = 1;
   req->completion.status = UCS_OK;
-  req->type              = NCCL_UCT_REQ_IFLUSH;
+  req->type              = NCCL_UCT_IFLUSH;
+  req->comm              = comm;
   *request               = req;
 
-  return nccl_uct_flush(base_comm, data[last], sizes[last], uct_memh[last],
+  return nccl_uct_flush(&comm->base, data[last], sizes[last], uct_memh[last],
                         &req->completion, request);
 }
 
 static void nccl_uct_wr_send_atp(nccl_uct_wr_comm_t *comm, nccl_uct_req_t *req,
-                                 nccl_uct_atp_t *atp)
+                                 nccl_uct_atp_t *atp)
 {
     ucs_status_t status;
 
@@ -379,9 +384,9 @@ static void nccl_uct_wr_send_atp(nccl_uct_wr_comm_t *comm, nccl_uct_req_t *req,
         req->completion.status = UCS_OK;
 
         status = nccl_uct_put(comm, atp, sizeof(*atp), comm->atp_memh,
-                              (nccl_uct_atp_t *)comm->remote.addr.atp_ptr + (req->id & NCCL_UCT_RING_SIZE),
-                              comm->remote.addr.addr.atp_rkey,
-                              &req->complete);
+                              (nccl_uct_atp_t *)comm->base.remote.addr.atp_ptr + (req->id & NCCL_UCT_RING_SIZE),
+                              comm->base.remote.addr.atp_rkey,
+                              &req->completion);
         if (status == UCS_ERR_NO_RESOURCE) { 
             req->completion.count = 0;
         } else {
@@ -393,28 +398,27 @@ static void nccl_uct_wr_send_atp(nccl_uct_wr_comm_t *comm, nccl_uct_req_t *req,
 // TODO Fix barriers here too
 static ncclResult_t nccl_uct_wr_test(void *request, int *done, int *sizes) {
   nccl_uct_req_t *req      = request;
-  nccl_uct_rdesc_t *rdesc  = req->rdesc;
-  nccl_uct_wr_comm_t *comm = rdesc->comm;
+  nccl_uct_wr_comm_t *comm = req->comm;
   int end                  = NCCL_UCT_RING_SIZE;
   volatile nccl_uct_atp_t *atp;
 
   while (uct_worker_progress(comm->base.uct_worker->worker)) {}
 
-  if (req->type == NCCL_UCT_REQ_IRECV) {
+  if (req->type == NCCL_UCT_IRECV) {
       if (req->completion.count > 0) {
           return ncclSuccess;
       }
 
       atp = &comm->atp[req->id & NCCL_UCT_RING_SIZE];
       assert(atp->rtr_id == req->id);
-      assert(rtr->id == req->id);
+      assert(comm->rtr[req->id & NCCL_UCT_RING_SIZE].id == req->id);
 
       *done = (atp->idx == atp->rtr_id);
       if (*done) {
-          memcpy(sizes, &atp->sizes[end - atp->count],
+          memcpy(sizes, (void *)&atp->sizes[end - atp->count],
                  atp->count * sizeof(*atp));
       }
-  } else if (req->type == NCCL_UCT_REQ_ISEND) {
+  } else if (req->type == NCCL_UCT_ISEND) {
       atp = &comm->atp[req->id & NCCL_UCT_RING_SIZE];
 
       if (req->completion.count == 2) {
@@ -422,7 +426,7 @@ static ncclResult_t nccl_uct_wr_test(void *request, int *done, int *sizes) {
           req->completion.count = 0;
       }
 
-      nccl_uct_wr_send_atp(comm, req, atp);
+      nccl_uct_wr_send_atp(comm, req, (nccl_uct_atp_t *)atp);
 
       if ((req->completion.count == 0) && (!atp->send_atp || atp->complete)) {
           *done = 1;
@@ -433,7 +437,7 @@ static ncclResult_t nccl_uct_wr_test(void *request, int *done, int *sizes) {
           *done = 0;
       }
   } else {
-      assert(req->type == NCCL_UCT_REQ_IFLUSH);
+      assert(req->type == NCCL_UCT_IFLUSH);
       *done = (req->completion.count == 0);
   }
 

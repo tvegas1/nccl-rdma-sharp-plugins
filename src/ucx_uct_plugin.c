@@ -20,12 +20,13 @@ typedef enum {
 
 /* On the wire ack message */
 typedef struct nccl_uct_atp {
-  int               sizes[NCCL_UCX_UCT_MAX_RECVS];
-  unsigned          rtr_id;     /* Id to match against idx */
-  short             count;      /* Original number of receives */
+  unsigned          idx_start;  /* Will match rtr_id when received */
   short             start;      /* How many left to start */
   short             complete;   /* How many left to complete */
   short             send_atp;
+  int               sizes[NCCL_UCX_UCT_MAX_RECVS];
+  short             count;      /* Original number of receives */
+  unsigned          rtr_id;     /* Id to match against idx */
   unsigned          idx;        /* Will match rtr_id when received */
 } nccl_uct_atp_t;
 
@@ -190,17 +191,19 @@ static ncclResult_t nccl_uct_wr_irecv(void *recv_comm, int n, void **data,
   rtr           = &comm->rtr[comm->rtr_id & NCCL_UCT_RING_MASK];
   rtr->count    = n;
   rtr->avail    = n;
-  rtr->send_atp = NCCL_UCT_ATP;
+  rtr->send_atp = NCCL_UCT_ATP_COMPLETE;
   rtr->id       = comm->rtr_id;
   rtr->id_start = comm->rtr_id;
 
   atp         = &comm->atp[comm->rtr_id & NCCL_UCT_RING_MASK];
   atp->rtr_id = rtr->id;
   atp->idx    = rtr->id;
+  atp->idx_start = rtr->id;
   atp->count  = n;
 
   if (rtr->send_atp) {
       atp->idx -= 0x01010101; /* Make it different */
+      atp->idx_start = atp->idx;
       memset((void *)atp->sizes, 0, sizeof(atp->sizes));
   } else {
       memcpy((void *)(atp->sizes + end - n), sizes, n * sizeof(*sizes));
@@ -279,6 +282,7 @@ static ncclResult_t nccl_uct_send(nccl_uct_wr_comm_t *comm, unsigned id,
         atp->complete = rtr->count;
         atp->send_atp = rtr->send_atp;
         atp->idx      = rtr->id;
+        atp->idx_start = rtr->id;
     } 
 
     TSHOOT("%p isend started req=%p req->id=%u idx=%u/%u size=%d", req, comm, id, i, rtr->count, size);
@@ -426,7 +430,7 @@ static ncclResult_t nccl_uct_wr_test(void *request, int *done, int *sizes) {
       assert(atp->rtr_id == req->id);
       assert(comm->rtr[req->id & NCCL_UCT_RING_MASK].id == req->id);
 
-      *done = (atp->idx == atp->rtr_id);
+      *done = (atp->idx == atp->rtr_id) && (atp->idx_start == atp->rtr_id);
       if (*done) {
           __sync_synchronize();
           TSHOOT("%p irecv rtr_id=%u completed", comm, req->id);

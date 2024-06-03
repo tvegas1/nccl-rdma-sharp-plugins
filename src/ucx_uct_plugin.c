@@ -25,8 +25,8 @@ typedef struct nccl_uct_atp {
   short             complete;   /* How many left to complete */
   short             send_atp;
   int               sizes[NCCL_UCX_UCT_MAX_RECVS];
-  short             count;      /* Original number of receives */
   unsigned          rtr_id;     /* Id to match against idx */
+  short             count;      /* Original number of receives */
   unsigned          idx;        /* Will match rtr_id when received */
 } nccl_uct_atp_t;
 
@@ -36,17 +36,23 @@ typedef struct nccl_uct_chunk {
     int             size;
     int             tag;
     uct_rkey_t      rkey;
+    unsigned        id;
 } nccl_uct_chunk_t;
 
+typedef struct nccl_uct_rtr_hdr {
+    unsigned        id_start;
+    unsigned char   count;
+    unsigned char   send_atp;      /* 0 no send, 1 send, 2 complete-send */
+    unsigned char   avail;         /* Total number of chunk left */
+    unsigned        id;
+    nccl_uct_chunk_t chunk[];
+} nccl_uct_rtr_hdr_t;
+
 /* On the wire request message */
-typedef struct {
-    unsigned         id_start;
-    nccl_uct_chunk_t chunk[NCCL_UCX_UCT_MAX_RECVS];
-    unsigned         count;         /* Total number of chunks */
-    unsigned         avail;         /* Total number of chunk left */
-    unsigned         send_atp;      /* 0 no send, 1 send, 2 complete-send */
-    unsigned         id;            /* Id of the receive */
-} nccl_uct_rtr_t;
+typedef struct nccl_uct_rtr {
+    nccl_uct_rtr_hdr_t hdr;
+    nccl_uct_chunk_t   _chunk[NCCL_UCX_UCT_MAX_RECVS];
+} nccl_uct_rtr_t ;
 
 /* Track the sending of a request */
 typedef struct {
@@ -207,27 +213,27 @@ static ncclResult_t nccl_uct_wr_irecv(void *recv_comm, int n, void **data,
 
   assert(n <= end);
 
-  rtr           = &comm->rtr[comm->rtr_id & NCCL_UCT_RING_MASK];
-  rtr->count    = n;
-  rtr->avail    = n;
-  rtr->id       = comm->rtr_id;
-  rtr->id_start = comm->rtr_id;
+  rtr               = &comm->rtr[comm->rtr_id & NCCL_UCT_RING_MASK];
+  rtr->hdr.count    = n;
+  rtr->hdr.avail    = n;
+  rtr->hdr.id_start = comm->rtr_id;
+  rtr->hdr.id       = comm->rtr_id;
 
   if (*request == (void*)0x1) {
-    rtr->send_atp = NCCL_UCT_NONE;
+    rtr->hdr.send_atp = NCCL_UCT_NONE;
   } else if (comm->ar_enabled) {
-               rtr->send_atp = NCCL_UCT_ATP_COMPLETE;
+      rtr->hdr.send_atp = NCCL_UCT_ATP_COMPLETE;
   } else {
-    rtr->send_atp = NCCL_UCT_ATP;
+    rtr->hdr.send_atp = NCCL_UCT_ATP;
   }
 
   atp         = &comm->atp[comm->rtr_id & NCCL_UCT_RING_MASK];
-  atp->rtr_id = rtr->id;
-  atp->idx    = rtr->id;
-  atp->idx_start = rtr->id;
+  atp->rtr_id = rtr->hdr.id;
+  atp->idx    = rtr->hdr.id;
+  atp->idx_start = rtr->hdr.id;
   atp->count  = n;
 
-  if (rtr->send_atp) {
+  if (rtr->hdr.send_atp) {
       atp->idx -= 0x01010101; /* Make it different */
       atp->idx_start = atp->idx;
       memset((void *)atp->sizes, 0, sizeof(atp->sizes));
@@ -235,12 +241,13 @@ static ncclResult_t nccl_uct_wr_irecv(void *recv_comm, int n, void **data,
       memcpy((void *)(atp->sizes + end - n), sizes, n * sizeof(*sizes));
   }
 
-  idx = end - n;
+  idx = 0;
   for (i = 0; i < n; i++, idx++) {
-      rtr->chunk[idx].data = data[i];
-      rtr->chunk[idx].size = sizes[i];
-      rtr->chunk[idx].tag  = tags[i];
-      rtr->chunk[idx].rkey = uct_memh[i]->bundle.rkey;
+      rtr->hdr.chunk[idx].data = data[i];
+      rtr->hdr.chunk[idx].size = sizes[i];
+      rtr->hdr.chunk[idx].tag  = tags[i];
+      rtr->hdr.chunk[idx].rkey = uct_memh[i]->bundle.rkey;
+      rtr->hdr.chunk[idx].id   = rtr->hdr.id;
   }
 
   req                    = &comm->req[comm->req_id & NCCL_UCT_RING_MASK];
@@ -252,7 +259,7 @@ static ncclResult_t nccl_uct_wr_irecv(void *recv_comm, int n, void **data,
   req->comm              = comm;
 
   __sync_synchronize();
-  status = nccl_uct_put(comm, rtr, sizeof(*rtr), comm->rtr_memh,
+  status = nccl_uct_put(comm, rtr, sizeof(rtr->hdr) + (n * sizeof(*rtr->hdr.chunk)), comm->rtr_memh,
                     ((nccl_uct_rtr_t *)comm->base.remote.addr.rtr_ptr) + (comm->rtr_id & NCCL_UCT_RING_MASK),
                         comm->base.remote.addr.rtr_rkey,
                         &req->completion);
@@ -276,7 +283,7 @@ static ncclResult_t nccl_uct_send(nccl_uct_wr_comm_t *comm, unsigned id,
     int end                      = NCCL_UCX_UCT_MAX_RECVS;
     volatile nccl_uct_rtr_t *rtr = &comm->rtr[id & NCCL_UCT_RING_MASK];
     nccl_uct_atp_t *atp          = &comm->atp[id & NCCL_UCT_RING_MASK];
-    volatile nccl_uct_chunk_t *chunk      = &rtr->chunk[end - rtr->count + i];
+    volatile nccl_uct_chunk_t *chunk      = &rtr->hdr.chunk[i];
     nccl_uct_req_t *req;
     ucs_status_t status;
 
@@ -299,28 +306,28 @@ static ncclResult_t nccl_uct_send(nccl_uct_wr_comm_t *comm, unsigned id,
         return ncclSuccess;
     }
 
-    if (rtr->avail == rtr->count) {
+    if (rtr->hdr.avail == rtr->hdr.count) {
         TSHOOT("%p isend new req_id=%u count=%u send_atp=%u atp=%p",
-             comm, rtr->id, rtr->count, rtr->send_atp, atp);
-        atp->rtr_id   = rtr->id;
-        atp->count    = rtr->count;
-        atp->start    = rtr->count;
-        atp->complete = rtr->count;
-        atp->send_atp = rtr->send_atp;
-        atp->idx      = rtr->id;
-        atp->idx_start = rtr->id;
+             comm, rtr->hdr.id, rtr->hdr.count, rtr->hdr.send_atp, atp);
+        atp->rtr_id   = rtr->hdr.id;
+        atp->count    = rtr->hdr.count;
+        atp->start    = rtr->hdr.count;
+        atp->complete = rtr->hdr.count;
+        atp->send_atp = rtr->hdr.send_atp;
+        atp->idx      = rtr->hdr.id;
+        atp->idx_start = rtr->hdr.id;
     } 
 
-    TSHOOT("%p isend started req=%p req->id=%u idx=%u/%u size=%d", req, comm, id, i, rtr->count, size);
+    TSHOOT("%p isend started req=%p req->id=%u idx=%u/%u size=%d", req, comm, id, i, rtr->hdr.count, size);
 
-    assert(req->id == rtr->id);
-    assert(atp->rtr_id == rtr->id);
-    assert(rtr->count == atp->count);
-    assert(rtr->avail > 0);
+    assert(req->id == rtr->hdr.id);
+    assert(atp->rtr_id == rtr->hdr.id);
+    assert(rtr->hdr.count == atp->count);
+    assert(rtr->hdr.avail > 0);
 
-    atp->sizes[end - rtr->count + i] = size;
+    atp->sizes[end - rtr->hdr.count + i] = size;
     atp->start--;
-    rtr->avail--;
+    rtr->hdr.avail--;
     chunk->tag = INT_MAX;
 
     comm->req_id++;
@@ -334,26 +341,28 @@ static ncclResult_t nccl_uct_wr_isend(void *send_comm, void *data, int size,
   nccl_uct_wr_comm_t *comm = nccl_uct_wr_comm_get(send_comm);
   volatile nccl_uct_rtr_t *rtr;
   unsigned id, i;
-  unsigned end = NCCL_UCX_UCT_MAX_RECVS;
 
   for (id = comm->rtr_id;; id++) {
       rtr = &comm->rtr[id & NCCL_UCT_RING_MASK];
-      if (rtr->id != id || rtr->id_start != id) {
+      if (rtr->hdr.id != id || rtr->hdr.id_start != id) {
           break;
       }
 
       __sync_synchronize(); /* TODO remove some synchronize? */
 
-      if (rtr->avail == 0) {
+      if (rtr->hdr.avail == 0) {
           if (id == comm->rtr_id) {
               comm->rtr_id++;
           }
           continue;
       }
-      TSHOOT("isend got id=%u n=%u", id, rtr->count);
+      TSHOOT("isend got id=%u n=%u", id, rtr->hdr.count);
 
-      for (i = 0; i < rtr->count; i++) {
-          if (rtr->chunk[end - rtr->count + i].tag == tag) {
+      for (i = 0; i < rtr->hdr.count; i++) {
+          if (rtr->hdr.chunk[i].id != id) {
+              break;
+          }
+          if (rtr->hdr.chunk[i].tag == tag) {
               return nccl_uct_send(comm, id, i, data, size, mhandle, request);
           }
       }
@@ -453,7 +462,7 @@ static ncclResult_t nccl_uct_wr_test(void *request, int *done, int *sizes) {
 
       atp = &comm->atp[req->id & NCCL_UCT_RING_MASK];
       assert(atp->rtr_id == req->id);
-      assert(comm->rtr[req->id & NCCL_UCT_RING_MASK].id == req->id);
+      assert(comm->rtr[req->id & NCCL_UCT_RING_MASK].hdr.id == req->id);
 
       *done = (atp->idx == atp->rtr_id) && (atp->idx_start == atp->rtr_id);
       if (*done) {

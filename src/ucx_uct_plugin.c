@@ -64,7 +64,7 @@ typedef struct {
     unsigned                idx;
 } nccl_uct_req_t;
 
-#define NCCL_UCT_RING_SIZE (128 * 4)    /* TODO: Add build static checks */
+#define NCCL_UCT_RING_SIZE 128    /* TODO: Add build static checks */
 #define NCCL_UCT_RING_MASK (NCCL_UCT_RING_SIZE - 1)
 
 #if 0

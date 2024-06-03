@@ -84,11 +84,28 @@ typedef struct nccl_uct_wr_comm {
   unsigned             req_id; /* Next NCCL request to allocate */
 
   unsigned             total;  /* Request in progress */
+
+  int                                                       ar_enabled;
 } nccl_uct_wr_comm_t;
 
 static inline nccl_uct_wr_comm_t *
 nccl_uct_wr_comm_get(nccl_uct_comm_t *base_comm) {
   return ucs_container_of(base_comm, nccl_uct_wr_comm_t, base);
+}
+
+static inline int nccl_uct_is_ar_enabled(void)
+{
+    static int cached = 0;
+    static int ar_enabled = 0;
+    const char *str;
+
+    if (!cached) {
+        cached = 1;
+        str = getenv("UCX_IB_AR_ENABLE");
+        ar_enabled = (str && *str == 'y');
+    }
+
+    return ar_enabled;
 }
 
 /* On receiver side, after ->irecv(), expect corresponding ATP */
@@ -134,7 +151,9 @@ static ncclResult_t nccl_uct_wr_comm_init(nccl_uct_comm_t *base_comm,
   comm->base.remote.addr.atp_ptr  = comm->atp;
   comm->base.remote.addr.atp_rkey = comm->atp_memh->bundle.rkey;
 
-  comm->rtr_id = 1;
+  comm->rtr_id     = 1;
+  comm->ar_enabled = nccl_uct_is_ar_enabled();
+
   return ncclSuccess;
 }
 
@@ -191,9 +210,16 @@ static ncclResult_t nccl_uct_wr_irecv(void *recv_comm, int n, void **data,
   rtr           = &comm->rtr[comm->rtr_id & NCCL_UCT_RING_MASK];
   rtr->count    = n;
   rtr->avail    = n;
-  rtr->send_atp = NCCL_UCT_ATP_COMPLETE;
   rtr->id       = comm->rtr_id;
   rtr->id_start = comm->rtr_id;
+
+  if (*request == (void*)0x1) {
+    rtr->send_atp = NCCL_UCT_NONE;
+  } else if (comm->ar_enabled) {
+               rtr->send_atp = NCCL_UCT_ATP_COMPLETE;
+  } else {
+    rtr->send_atp = NCCL_UCT_ATP;
+  }
 
   atp         = &comm->atp[comm->rtr_id & NCCL_UCT_RING_MASK];
   atp->rtr_id = rtr->id;
@@ -288,7 +314,6 @@ static ncclResult_t nccl_uct_send(nccl_uct_wr_comm_t *comm, unsigned id,
     TSHOOT("%p isend started req=%p req->id=%u idx=%u/%u size=%d", req, comm, id, i, rtr->count, size);
 
     assert(req->id == rtr->id);
-    assert(atp->send_atp);
     assert(atp->rtr_id == rtr->id);
     assert(rtr->count == atp->count);
     assert(rtr->avail > 0);

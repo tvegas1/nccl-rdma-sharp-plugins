@@ -37,7 +37,7 @@ typedef struct nccl_uct_chunk {
     int             tag;
     uct_rkey_t      rkey;
     unsigned        id;
-} nccl_uct_chunk_t;
+} __attribute__((aligned(32))) nccl_uct_chunk_t;
 
 typedef struct nccl_uct_rtr_hdr {
     unsigned        id_start;
@@ -52,7 +52,7 @@ typedef struct nccl_uct_rtr_hdr {
 typedef struct nccl_uct_rtr {
     nccl_uct_rtr_hdr_t hdr;
     nccl_uct_chunk_t   _chunk[NCCL_UCX_UCT_MAX_RECVS];
-} nccl_uct_rtr_t ;
+} __attribute__((aligned(64))) nccl_uct_rtr_t ;
 
 /* Track the sending of a request */
 typedef struct {
@@ -64,7 +64,7 @@ typedef struct {
     unsigned                idx;
 } nccl_uct_req_t;
 
-#define NCCL_UCT_RING_SIZE 128    /* TODO: Add build static checks */
+#define NCCL_UCT_RING_SIZE 256 /* TODO: Add build static checks */
 #define NCCL_UCT_RING_MASK (NCCL_UCT_RING_SIZE - 1)
 
 #if 0
@@ -91,7 +91,7 @@ typedef struct nccl_uct_wr_comm {
 
   unsigned             total;  /* Request in progress */
 
-  int                                                       ar_enabled;
+  int                  ar_enabled;
 } nccl_uct_wr_comm_t;
 
 static inline nccl_uct_wr_comm_t *
@@ -213,16 +213,16 @@ static ncclResult_t nccl_uct_wr_irecv(void *recv_comm, int n, void **data,
 
   assert(n <= end);
 
-  rtr               = &comm->rtr[comm->rtr_id & NCCL_UCT_RING_MASK];
+  rtr           = &comm->rtr[comm->rtr_id & NCCL_UCT_RING_MASK];
   rtr->hdr.count    = n;
   rtr->hdr.avail    = n;
-  rtr->hdr.id_start = comm->rtr_id;
   rtr->hdr.id       = comm->rtr_id;
+  rtr->hdr.id_start = comm->rtr_id;
 
   if (*request == (void*)0x1) {
     rtr->hdr.send_atp = NCCL_UCT_NONE;
   } else if (comm->ar_enabled) {
-      rtr->hdr.send_atp = NCCL_UCT_ATP_COMPLETE;
+        rtr->hdr.send_atp = NCCL_UCT_ATP_COMPLETE;
   } else {
     rtr->hdr.send_atp = NCCL_UCT_ATP;
   }
@@ -348,7 +348,12 @@ static ncclResult_t nccl_uct_wr_isend(void *send_comm, void *data, int size,
           break;
       }
 
-      __sync_synchronize(); /* TODO remove some synchronize? */
+      TSHOOT("isend got id=%u n=%u", id, rtr->hdr.count);
+
+      for (i = 0; i < rtr->hdr.count; i++) {
+          while (rtr->hdr.chunk[i].id != id) {
+          }
+      }
 
       if (rtr->hdr.avail == 0) {
           if (id == comm->rtr_id) {
@@ -357,6 +362,8 @@ static ncclResult_t nccl_uct_wr_isend(void *send_comm, void *data, int size,
           continue;
       }
       TSHOOT("isend got id=%u n=%u", id, rtr->hdr.count);
+
+      __sync_synchronize(); /* TODO remove some synchronize? */
 
       for (i = 0; i < rtr->hdr.count; i++) {
           if (rtr->hdr.chunk[i].id != id) {

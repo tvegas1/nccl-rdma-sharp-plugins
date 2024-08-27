@@ -31,6 +31,8 @@ extern ncclNet_v8_t ucxUctRdPlugin_v8;
 extern ncclNet_v7_t ucxUctRdPlugin_v7;
 extern ncclNet_v6_t ucxUctRdPlugin_v6;
 extern ncclNet_v5_t ucxUctRdPlugin_v5;
+
+extern ncclNet_v8_t ucxPutPlugin_v8;
 #endif
 
 extern ncclNet_v8_t ibPlugin_v8;
@@ -99,6 +101,7 @@ static void pluginSetup()
 #ifdef HAVE_UCX_PLUGIN
     else if (!strcasecmp(p2p_layer, "ucx")) p2p_plugin = NCCL_P2P_UCX;
     else if (!strcasecmp(p2p_layer, "ucx_rma")) p2p_plugin = NCCL_P2P_UCX_RMA;
+    else if (!strcasecmp(p2p_layer, "ucx_put")) p2p_plugin = NCCL_P2P_UCX_PUT;
     else if (!strcasecmp(p2p_layer, "ucx_uct")) p2p_plugin = NCCL_P2P_UCX_UCT;
     else if (!strcasecmp(p2p_layer, "ucx_uct_read")) p2p_plugin = NCCL_P2P_UCX_UCT_RD;
 #endif
@@ -131,6 +134,9 @@ static void pluginSetup()
       ncclNetPlugin_v7 = ucxUctRdPlugin_v7;
       ncclNetPlugin_v6 = ucxUctRdPlugin_v6;
       ncclNetPlugin_v5 = ucxUctRdPlugin_v5;
+      break;
+    case NCCL_P2P_UCX_PUT:
+      ncclNetPlugin_v8 = ucxPutPlugin_v8;
       break;
 #endif
     default:
@@ -246,7 +252,7 @@ ncclResult_t nccl_p2p_ib_get_properties(ncclIbDev *devs, int dev, ncclNetPropert
   props->port = ibDev->portNum + ibDev->realPort;
   props->maxComms = ibDev->maxQp;
 
-  if (p2p_plugin == NCCL_P2P_IB || p2p_plugin == NCCL_P2P_UCX ||
+  if (p2p_plugin == NCCL_P2P_IB || p2p_plugin == NCCL_P2P_UCX || p2p_plugin == NCCL_P2P_UCX_PUT ||
       nccl_p2p_is_uct_plugin(p2p_plugin)) {
     props->maxRecvs = NCCL_NET_IB_MAX_RECVS;
   } else {

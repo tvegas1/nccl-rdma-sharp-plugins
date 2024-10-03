@@ -944,10 +944,6 @@ static ncclResult_t nccl_ucp_send(nccl_ucp_comm_t *comm, unsigned short id,
   return ncclSuccess;
 }
 
-/* TODO: Check that the plugin advertizes DMABUF support */
-/* TODO: Early return if no request is available */
-/* TODO: Early return if no rtr is available */
-/* TODO: progress almost all non-progress paths */
 static ncclResult_t nccl_ucx_rma_isend(void *send_comm, void *data, int size,
                                        int tag, void *mhandle, void **request) {
   ncclResult_t result   = ncclSuccess;
@@ -1096,10 +1092,6 @@ static void nccl_ucp_req_release(nccl_ucp_req_t *req) {
   req->comm = NULL;
 }
 
-/* TODO: multi recv */
-/* TODO: check flush */
-/* TODO: Check small size optim */
-/* TODO: Check big size optim */
 static ncclResult_t nccl_ucx_rma_test(void *request, int *done, int *sizes) {
   nccl_ucp_req_t *req   = request;
   nccl_ucp_comm_t *comm = req->comm;

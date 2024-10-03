@@ -98,6 +98,7 @@ static void pluginSetup()
     if (!strcasecmp(p2p_layer, "ib")) p2p_plugin = NCCL_P2P_IB;
 #ifdef HAVE_UCX_PLUGIN
     else if (!strcasecmp(p2p_layer, "ucx")) p2p_plugin = NCCL_P2P_UCX;
+    else if (!strcasecmp(p2p_layer, "ucx_rma")) p2p_plugin = NCCL_P2P_UCX_RMA;
     else if (!strcasecmp(p2p_layer, "ucx_uct")) p2p_plugin = NCCL_P2P_UCX_UCT;
     else if (!strcasecmp(p2p_layer, "ucx_uct_read")) p2p_plugin = NCCL_P2P_UCX_UCT_RD;
 #endif

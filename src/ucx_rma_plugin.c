@@ -233,23 +233,23 @@ static nccl_ucp_context_t context = {
 static pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
-static ncclResult_t nccl_ucp_put_init(ncclDebugLogger_t logFunction) {
+static ncclResult_t nccl_ucx_rma_init(ncclDebugLogger_t logFunction) {
     return nccl_p2p_ib_init(&context.dev_count, ncclIbDevs,
                             context.if_name, &context.if_addr,
                             NULL, logFunction);
 }
 
-static ncclResult_t nccl_ucp_put_devices(int *ndev) {
+static ncclResult_t nccl_ucx_rma_devices(int *ndev) {
     *ndev = context.dev_count;
     return ncclSuccess;
 }
 
-static ncclResult_t nccl_ucp_put_get_properties(int dev,
+static ncclResult_t nccl_ucx_rma_get_properties(int dev,
                                                 ncclNetProperties_t *props) {
   return nccl_p2p_ib_get_properties(ncclIbDevs, dev, props);
 }
 
-static ncclResult_t nccl_ucp_put_listen(int dev, void *listen_handle,
+static ncclResult_t nccl_ucx_rma_listen(int dev, void *listen_handle,
                                         void **listen_comm)
 {
     nccl_ucp_listen_handle_t *handle = listen_handle;
@@ -288,7 +288,7 @@ static ncclResult_t nccl_ucp_put_listen(int dev, void *listen_handle,
     return ncclSuccess;
 }
 
-static ncclResult_t nccl_ucp_put_close_listen(void *listen_comm)
+static ncclResult_t nccl_ucx_rma_close_listen(void *listen_comm)
 {
     nccl_ucp_listen_comm_t *comm = listen_comm;
 
@@ -396,6 +396,7 @@ static void nccl_ucp_worker_put(nccl_ucp_worker_t *worker)
 {
     int found = 0;
     nccl_ucp_worker_t **w;
+    (void)found;
 
     pthread_mutex_lock(&global_lock);
     if (--worker->used < 1) {
@@ -463,7 +464,7 @@ static nccl_ucp_memh_t *nccl_ucp_mem_register(nccl_ucp_comm_t *comm,
     return mh;
 }
 
-static ncclResult_t nccl_ucp_put_deregmr(void *dereg_comm, void *mhandle)
+static ncclResult_t nccl_ucx_rma_deregmr(void *dereg_comm, void *mhandle)
 {
     nccl_ucp_comm_t *comm = dereg_comm;
     nccl_ucp_memh_t *mh   = mhandle;
@@ -527,7 +528,7 @@ static nccl_ucp_comm_t *nccl_ucp_comm_create(int dev, nccl_ucp_req_type_t type)
     comm->gpu_flush = (nccl_p2p_gdr_support(comm->dev) == ncclSuccess) ||
                       (nccl_p2p_dmabuf_support(comm->dev) == ncclSuccess);
     if (comm->gpu_flush && (nccl_ucp_flush_ep_init(comm) != ncclSuccess)) {
-        nccl_ucp_put_deregmr(comm, comm->local.share_mh);
+        nccl_ucx_rma_deregmr(comm, comm->local.share_mh);
         free(comm);
         return NULL;
     }
@@ -549,7 +550,7 @@ static ncclResult_t nccl_ucp_ep_create(nccl_ucp_comm_t *comm)
     return ncclSuccess;
 }
 
-static ncclResult_t nccl_ucp_put_connect(
+static ncclResult_t nccl_ucx_rma_connect(
                                  int dev, void *listen_handle,
                                  void **send_comm,
                                  ncclNetDeviceHandle_t **sendDevComm)
@@ -634,7 +635,7 @@ static ncclResult_t nccl_ucp_put_connect(
     return ncclSuccess;
 }
 
-ncclResult_t nccl_ucp_put_accept(void *listen_comm, void **recv_comm,
+ncclResult_t nccl_ucx_rma_accept(void *listen_comm, void **recv_comm,
                                  ncclNetDeviceHandle_v7_t **recvDevComm)
 {
     nccl_ucp_listen_comm_t *l_comm = listen_comm;
@@ -794,7 +795,7 @@ static int nccl_ucp_mh_update(nccl_ucp_comm_t *comm, nccl_ucp_memh_t *mh)
     return mh->sent == 0;
 }
 
-static ncclResult_t nccl_ucp_put_regmr(void *reg_comm, void *data, size_t size,
+static ncclResult_t nccl_ucx_rma_regmr(void *reg_comm, void *data, size_t size,
                                        int type, void  **mhandle)
 {
     nccl_ucp_comm_t *comm = reg_comm;
@@ -815,17 +816,17 @@ static ncclResult_t nccl_ucp_put_regmr(void *reg_comm, void *data, size_t size,
     return *mhandle? ncclSuccess : ncclSystemError;
 }
 
-static ncclResult_t nccl_ucp_put_regmr_dmabuf(void* comm, void* data,
+static ncclResult_t nccl_ucx_rma_regmr_dmabuf(void* comm, void* data,
                                               size_t size,
                                               int type, uint64_t offset, int fd,
                                               void** mhandle)
 {
     (void)fd; /* UCX performs the lookup automatically */
     assert(offset == 0);
-    return nccl_ucp_put_regmr(comm, data, size, type, mhandle);
+    return nccl_ucx_rma_regmr(comm, data, size, type, mhandle);
 }
 
-static ncclResult_t nccl_ucp_put_irecv(void *recv_comm, int n, void **data,
+static ncclResult_t nccl_ucx_rma_irecv(void *recv_comm, int n, void **data,
                                        int *sizes, int *tags, void **mhandle,
                                        void **request)
 {
@@ -1007,7 +1008,7 @@ static ncclResult_t nccl_ucp_send(nccl_ucp_comm_t *comm,
 /* TODO: Early return if no request is available */
 /* TODO: Early return if no rtr is available */
 /* TODO: progress almost all non-progress paths */
-static ncclResult_t nccl_ucp_put_isend(void *send_comm, void *data, int size,
+static ncclResult_t nccl_ucx_rma_isend(void *send_comm, void *data, int size,
                                        int tag, void *mhandle, void **request)
 {
     ncclResult_t result   = ncclSuccess;
@@ -1070,7 +1071,7 @@ static int nccl_ucp_flush_index(nccl_ucp_comm_t *comm, int *sizes, int n)
     return last;
 }
 
-static ncclResult_t nccl_ucp_put_iflush(void *recv_comm,
+static ncclResult_t nccl_ucx_rma_iflush(void *recv_comm,
                                         int n, void **data,
                                         int *sizes, void **mhandle,
                                         void **request)
@@ -1116,7 +1117,7 @@ static ncclResult_t nccl_ucp_put_iflush(void *recv_comm,
     return ncclSuccess;
 }
 
-static ncclResult_t nccl_ucp_put_close_comm(void *close_comm)
+static ncclResult_t nccl_ucx_rma_close_comm(void *close_comm)
 {
     int i;
     nccl_ucp_comm_t *comm = close_comm;
@@ -1150,7 +1151,7 @@ static ncclResult_t nccl_ucp_put_close_comm(void *close_comm)
     }
 
     if (comm->local.share_mh != NULL) {
-        nccl_ucp_put_deregmr(comm, comm->local.share_mh);
+        nccl_ucx_rma_deregmr(comm, comm->local.share_mh);
     }
     ncclSocketClose(&comm->sock);
     nccl_ucp_worker_put(comm->worker);
@@ -1169,7 +1170,7 @@ static void nccl_ucp_req_release(nccl_ucp_req_t *req)
 /* TODO: check flush */
 /* TODO: Check small size optim */
 /* TODO: Check big size optim */
-static ncclResult_t nccl_ucp_put_test(void *request, int *done, int *sizes)
+static ncclResult_t nccl_ucx_rma_test(void *request, int *done, int *sizes)
 {
     nccl_ucp_req_t *req   = request;
     nccl_ucp_comm_t *comm = req->comm;
@@ -1240,20 +1241,20 @@ static ncclResult_t nccl_ucp_put_test(void *request, int *done, int *sizes)
 
 ncclNet_v8_t ucxPutPlugin_v8 = {
     .name          = "UCX-RMA",
-    .init          = nccl_ucp_put_init,
-    .devices       = nccl_ucp_put_devices,
-    .getProperties = nccl_ucp_put_get_properties,
-    .listen        = nccl_ucp_put_listen,
-    .connect       = nccl_ucp_put_connect,
-    .accept        = nccl_ucp_put_accept,
-    .regMr         = nccl_ucp_put_regmr,
-    .regMrDmaBuf   = nccl_ucp_put_regmr_dmabuf,
-    .deregMr       = nccl_ucp_put_deregmr,
-    .isend         = nccl_ucp_put_isend,
-    .irecv         = nccl_ucp_put_irecv,
-    .iflush        = nccl_ucp_put_iflush,
-    .test          = nccl_ucp_put_test,
-    .closeSend     = nccl_ucp_put_close_comm,
-    .closeRecv     = nccl_ucp_put_close_comm,
-    .closeListen   = nccl_ucp_put_close_listen,
+    .init          = nccl_ucx_rma_init,
+    .devices       = nccl_ucx_rma_devices,
+    .getProperties = nccl_ucx_rma_get_properties,
+    .listen        = nccl_ucx_rma_listen,
+    .connect       = nccl_ucx_rma_connect,
+    .accept        = nccl_ucx_rma_accept,
+    .regMr         = nccl_ucx_rma_regmr,
+    .regMrDmaBuf   = nccl_ucx_rma_regmr_dmabuf,
+    .deregMr       = nccl_ucx_rma_deregmr,
+    .isend         = nccl_ucx_rma_isend,
+    .irecv         = nccl_ucx_rma_irecv,
+    .iflush        = nccl_ucx_rma_iflush,
+    .test          = nccl_ucx_rma_test,
+    .closeSend     = nccl_ucx_rma_close_comm,
+    .closeRecv     = nccl_ucx_rma_close_comm,
+    .closeListen   = nccl_ucx_rma_close_listen,
 };

@@ -31,8 +31,6 @@ extern ncclNet_v8_t ucxUctRdPlugin_v8;
 extern ncclNet_v7_t ucxUctRdPlugin_v7;
 extern ncclNet_v6_t ucxUctRdPlugin_v6;
 extern ncclNet_v5_t ucxUctRdPlugin_v5;
-
-extern ncclNet_v8_t ucxPutPlugin_v8;
 #endif
 
 extern ncclNet_v8_t ibPlugin_v8;

@@ -1239,7 +1239,7 @@ static ncclResult_t nccl_ucp_put_test(void *request, int *done, int *sizes)
 }
 
 ncclNet_v8_t ucxPutPlugin_v8 = {
-    .name          = "UCX-PUT",
+    .name          = "UCX-RMA",
     .init          = nccl_ucp_put_init,
     .devices       = nccl_ucp_put_devices,
     .getProperties = nccl_ucp_put_get_properties,

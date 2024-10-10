@@ -109,8 +109,9 @@ for TEST_EXE in ${NCCL_TEST_EXE[@]}; do
     #===================
     # Enable ucx_rma tests once this is resolved: https://redmine.mellanox.com/issues/3037941
     # for P2P_LAYER in ucx ucx_rma ib
-    for P2P_LAYER in ib ucx ucx_rma ucx_uct ucx_uct_read; do
-        MPIRUN_OPTIONS_PLUGIN_P2P_LAYER="-x NCCL_PLUGIN_P2P=${P2P_LAYER}"
+    for P2P_LAYER in ucx_rma ib ucx ucx_rma ucx_uct ucx_uct_read; do
+        MPIRUN_OPTIONS_PLUGIN_P2P_LAYER="-x NCCL_PLUGIN_P2P=${P2P_LAYER} -x UCX_LOG_LEVEL=debug -x NCCL_DEBUG=info -x NCCL_DEBUG_SUBSYS=net"
+
 
         #===================
         # NCCL_PROTO

@@ -283,6 +283,7 @@ static ncclResult_t nccl_ucx_rma_listen(int dev, void *listen_handle,
 
 static ncclResult_t nccl_ucx_rma_close_listen(void *listen_comm) {
   nccl_ucp_listen_comm_t *comm = listen_comm;
+  WARN("Close listen comm=%p", listen_comm);
 
   if (comm) {
     NCCLCHECK(ncclSocketClose(&comm->sock));
@@ -337,7 +338,7 @@ static ncclResult_t nccl_ucp_context_create(int dev,
            ncclIbDevs[dev].portNum);
   UCXCHECK(ucp_config_read("NCCL", NULL, &config));
   UCXCHECK(ucp_config_modify(config, "NET_DEVICES", ucx_dev_name));
-  UCXCHECK(ucp_config_modify(config, "TLS", "rc_x,cuda_copy"));
+  UCXCHECK(ucp_config_modify(config, "TLS", "rc_x"));
 
   params.field_mask = UCP_PARAM_FIELD_FEATURES | UCP_PARAM_FIELD_REQUEST_SIZE;
   params.features   = UCP_FEATURE_RMA | UCP_FEATURE_AM;
@@ -792,6 +793,8 @@ static ncclResult_t nccl_ucx_rma_irecv(void *recv_comm, int n, void **data,
   void *remote;
   ucs_status_t status;
 
+  WARN("irecv comm=%p", recv_comm);
+
   req = &comm->req[comm->req_id & NCCL_UCP_RING_MASK];
   rtr = &comm->local.share.rtr[comm->rtr_id & NCCL_UCP_RING_MASK];
   atp = &comm->local.share.atp[comm->rtr_id & NCCL_UCP_RING_MASK];
@@ -845,6 +848,8 @@ static ncclResult_t nccl_ucx_rma_irecv(void *recv_comm, int n, void **data,
     comm->total++;
 
     *request = req;
+  } else {
+      WARN("irecv comm=%p not put", recv_comm);
   }
 
   return ncclSuccess;
@@ -954,6 +959,7 @@ static ncclResult_t nccl_ucx_rma_isend(void *send_comm, void *data, int size,
 
   *request = NULL;
 
+  WARN("isend comm=%p", send_comm);
   assert(tag != INT_MAX);
   for (id = comm->rtr_id;; id++) {
     rtr = &comm->local.share.rtr[id & NCCL_UCP_RING_MASK];
@@ -976,6 +982,7 @@ static ncclResult_t nccl_ucx_rma_isend(void *send_comm, void *data, int size,
 
     for (i = 0; i < rtr->count; i++) {
       if (rtr->chunk[i].tag == tag) {
+        WARN("isend comm=%p match", send_comm);
         result = nccl_ucp_send(comm, id, i, data, size, mhandle, request);
         goto out;
       }
@@ -987,6 +994,9 @@ out:
     ucp_worker_progress(comm->worker->ucp_worker);
   }
 
+  if (*request == NULL) {
+      WARN("isend comm=%p not progressed", send_comm);
+  }
   return result;
 }
 
@@ -1048,6 +1058,7 @@ static ncclResult_t nccl_ucx_rma_iflush(void *recv_comm, int n, void **data,
 static ncclResult_t nccl_ucx_rma_close_comm(void *close_comm) {
   int i;
   nccl_ucp_comm_t *comm = close_comm;
+  WARN("Close comm=%p", close_comm);
 
   assert(comm->total == 0);
   assert(comm->inflight_rkey == 0);

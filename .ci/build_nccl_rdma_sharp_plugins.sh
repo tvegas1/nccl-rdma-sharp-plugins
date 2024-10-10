@@ -10,6 +10,9 @@ cd "${SCRIPT_DIR}"
 
 cd "${WORKSPACE}"
 
+sudo apt install -y gdb vim || :
+apt install -y gdb vim || :
+
 if ! "${WORKSPACE}/autogen.sh"; then
     echo "ERROR: ${WORKSPACE}/autogen.sh failed"
     echo "FAIL"
